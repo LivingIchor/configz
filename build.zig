@@ -5,20 +5,23 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
-        .name = "configz",
+        .name = "configzd",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            // List of modules available for import in source files part of the
-            // root module.
-            .imports = &.{
-                .{ .name = "configz", .module = mod },
-            },
         }),
     });
-
     b.installArtifact(exe);
+
+    exe.linkSystemLibrary("git2");
+    exe.linkLibC();
+
+    const install_cli = b.addInstallFile(
+        b.path("cli/configz.sh"),
+        "bin/configz",
+    );
+    b.getInstallStep().dependOn(&install_cli.step);
 
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);

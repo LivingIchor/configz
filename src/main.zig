@@ -1,6 +1,10 @@
 const std = @import("std");
 const configz = @import("configz");
 
+const git = @cImport({
+    @cInclude("git2.h");
+});
+
 pub fn main() !void {
     // Prints to stderr, ignoring potential errors.
     std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
