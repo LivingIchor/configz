@@ -45,7 +45,7 @@ function require {
 # Sends a status request to configzd and prints the current state of tracked files
 function cmd_status {
     local payload response ok
-    payload=$(jq -n '{"cmd": "status"}')
+    payload=$(jq -n '{"cmd": "status", "args": []}')
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
     ok=$(echo "$response" | jq -r '.ok')
@@ -62,7 +62,7 @@ function cmd_status {
 # Sends a log request to configzd and prints recent dotfile commit history
 function cmd_log {
     local payload response ok
-    payload=$(jq -n '{"cmd": "log"}')
+    payload=$(jq -n '{"cmd": "log", "args": []}')
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
     ok=$(echo "$response" | jq -r '.ok')
@@ -96,11 +96,11 @@ function cmd_sync {
         payload=$(jq -n \
             --arg subject "$subject" \
             --arg body "$body" \
-            '{"cmd": "sync", "args": {"subject": $subject, "body": $body}}')
+            '{"cmd": "sync", "args": [$subject, $body]}')
     else
         payload=$(jq -n \
             --arg subject "$subject" \
-            '{"cmd": "sync", "args": {"subject": $subject}}')
+            '{"cmd": "sync", "args": [$subject]}')
     fi
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
@@ -118,7 +118,7 @@ function cmd_sync {
 # Pulls the latest changes from remote and merges them into the working tree
 function cmd_pull {
     local payload response ok
-    payload=$(jq -n '{"cmd": "pull"}')
+    payload=$(jq -n '{"cmd": "pull", "args": []}')
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
     ok=$(echo "$response" | jq -r '.ok')
@@ -135,7 +135,7 @@ function cmd_pull {
 # Fetches latest changes from remote without merging into the working tree
 function cmd_fetch {
     local payload response ok
-    payload=$(jq -n '{"cmd": "fetch"}')
+    payload=$(jq -n '{"cmd": "fetch", "args": []}')
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
     ok=$(echo "$response" | jq -r '.ok')
@@ -156,7 +156,7 @@ function cmd_init {
     local payload response ok
     payload=$(jq -n \
         --arg remote "$1" \
-        '{"cmd": "init", "args": {"remote": $remote}}')
+        '{"cmd": "init", "args": [$remote]}')
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
     ok=$(echo "$response" | jq -r '.ok')
@@ -214,7 +214,7 @@ function cmd_add {
 
     local payload response ok
     payload=$(jq -n \
-        --args '{"cmd": "add", "files": $ARGS.positional}' \
+        --args '{"cmd": "add", "args": $ARGS.positional}' \
         -- "$@")
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
@@ -235,7 +235,7 @@ function cmd_drop {
 
     local payload response ok
     payload=$(jq -n \
-        --args '{"cmd": "drop", "files": $ARGS.positional}' \
+        --args '{"cmd": "drop", "args": $ARGS.positional}' \
         -- "$@")
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
