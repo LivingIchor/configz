@@ -1,31 +1,67 @@
 const std = @import("std");
-const configz = @import("configz");
+const clap = @import("clap");
 
 const git = @cImport({
     @cInclude("git2.h");
 });
 
-pub fn main() !void {
-    // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-    try configz.bufferedPrint();
-}
+pub fn main(init: std.process.Init) !void {
+    var argv = std.process.Args.iterate(init.minimal.args);
+    const procname = argv.next().?;
+    const errbuf = try init.gpa.alloc(u8, 1024);
+    defer init.gpa.free(errbuf);
+    var stderr_writer = std.Io.File.writer(.stderr(), init.io, errbuf);
+    var stderr = &stderr_writer.interface;
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help        Show this help message
+        \\-d, --daemon      Run as a separate daemon (for running outside systemd)
+    );
 
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
+    var diag = clap.Diagnostic{};
+    var res = clap.parse(clap.Help, &params, clap.parsers.default, init.minimal.args, .{
+        .diagnostic = &diag,
+        .allocator = init.gpa,
+    }) catch |err| {
+        try diag.reportToFile(init.io, .stderr(), err);
+        return err;
     };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
+    defer res.deinit();
+
+    if (res.args.help != 0) {
+        try stderr.print("Usage: {s} ", .{std.fs.path.basename(procname)});
+        try clap.usage(stderr, clap.Help, &params);
+        try stderr.print("\n\nOptions:\n", .{});
+        try clap.help(stderr, clap.Help, &params, .{});
+        try stderr.print("\n", .{});
+        try stderr.flush();
+        return;
+    }
+
+    if (res.args.daemon != 0)
+        try daemonize(init);
 }
+
+fn daemonize(init: std.process.Init) !void {
+    // First fork
+    const pid1 = std.os.linux.fork();
+    if (pid1 != 0) std.process.exit(0); // parent exits
+
+    // New session
+    _ = std.os.linux.setsid();
+
+    // Second fork
+    const pid2 = std.os.linux.fork();
+    if (pid2 != 0) std.process.exit(0); // first child exits
+
+    // Redirect stdin/stdout/stderr to /dev/null
+    const devnull = try std.Io.Dir.openFileAbsolute(init.io, "/dev/null", .{ .mode = .read_write });
+    _ = std.os.linux.dup2(devnull.handle, std.posix.STDIN_FILENO);
+    _ = std.os.linux.dup2(devnull.handle, std.posix.STDOUT_FILENO);
+    _ = std.os.linux.dup2(devnull.handle, std.posix.STDERR_FILENO);
+    devnull.close(init.io);
+
+    // Change working directory
+    _ = std.os.linux.chdir("/");
+}
+

@@ -14,8 +14,14 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
-    exe.linkSystemLibrary("git2");
-    exe.linkLibC();
+    const clap = b.dependency("clap", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("clap", clap.module("clap"));
+
+    exe.root_module.linkSystemLibrary("git2", .{});
+    exe.root_module.link_libc = true;
 
     const install_cli = b.addInstallFile(
         b.path("cli/configz.sh"),
