@@ -4,13 +4,10 @@
 #
 # Usage:
 #     configz                         — Show status of tracked dotfile changes
-#     configz log                     — Show recent commit history
 #     configz sync                    — Commit and push all tracked changes
-#     configz pull                    — Pull latest changes from remote
-#     configz fetch                   — Fetch latest changes from remote without merging
+#     configz purge                   — Permanently delete the local repo and all data"
 #     configz init <remote>           — Initialize bare repo and set remote
 #     configz git -- <args>           — Pass commands directly to git
-#     configz diff <file|all>         — Show unstaged changes for a file or all tracked files
 #     configz add <file> [file...]    — Begin tracking a file
 #     configz drop <file> [file...]   — Stop tracking a file
 
@@ -27,10 +24,10 @@ CYN='\033[0;36m'
 BLD='\033[1m'
 RST='\033[0m'
 
-function header  { echo -e "\n${BLU}${BLD}==> $*${RST}"; }
+function header  { echo -e "${BLU}${BLD}==> $*${RST}"; }
 function info    { echo -e "  ${CYN}->${RST} $*"; }
 function warn    { echo -e "  ${YLW}!${RST}  $*"; }
-function die     { echo -e "\n${RED}configz: $*${RST}\n" >&2; exit 1; }
+function die     { echo -e "${RED}configz: $*${RST}" >&2; exit 1; }
 function debug { if [[ "${CONFIGZ_DEBUG:-0}" == "1" ]]; then echo "  [DEBUG] $*"; fi; }
 
 function require {
@@ -39,30 +36,30 @@ function require {
     done
 }
 
+# Resolves a path to be relative to $HOME, errors if outside home
+function resolve_path {
+    local path="$1"
+    # Make absolute if relative
+    if [[ "$path" != /* ]]; then
+        path="$(pwd)/$path"
+    fi
+    # Normalize the path
+    path="$(realpath -m "$path")"
+    # Check if it's inside HOME
+    if [[ "$path" != "$HOME"/* ]]; then
+        die "file must be inside home directory: $path"
+    fi
+    # Make relative to HOME
+    echo "${path#"$HOME"/}"
+}
+
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 # Sends a status request to configzd and prints the current state of tracked files
 function cmd_status {
     local payload response ok
-    payload=$(jq -n '{"cmd": "status", "args": []}')
-
-    response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
-    ok=$(echo "$response" | jq -r '.ok')
-
-    if [[ "$ok" == "true" ]]; then
-        echo "$response" | jq -r '.output'
-    elif [[ "$ok" == "false" ]]; then
-        die "$(echo "$response" | jq -r '.output')"
-    else
-        die "Malformed response from configzd"
-    fi
-}
-
-# Sends a log request to configzd and prints recent dotfile commit history
-function cmd_log {
-    local payload response ok
-    payload=$(jq -n '{"cmd": "log", "args": []}')
+    payload=$(jq -cn '{"cmd": "status", "args": []}')
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
     ok=$(echo "$response" | jq -r '.ok')
@@ -93,12 +90,12 @@ function cmd_sync {
 
     local payload response ok
     if [[ -n "$body" ]]; then
-        payload=$(jq -n \
+        payload=$(jq -cn \
             --arg subject "$subject" \
             --arg body "$body" \
             '{"cmd": "sync", "args": [$subject, $body]}')
     else
-        payload=$(jq -n \
+        payload=$(jq -cn \
             --arg subject "$subject" \
             '{"cmd": "sync", "args": [$subject]}')
     fi
@@ -107,7 +104,7 @@ function cmd_sync {
     ok=$(echo "$response" | jq -r '.ok')
 
     if [[ "$ok" == "true" ]]; then
-        echo "${GRN}Sync successful${RST}"
+        echo -e "${GRN}Sync successful${RST}"
     elif [[ "$ok" == "false" ]]; then
         die "$(echo "$response" | jq -r '.output')"
     else
@@ -115,38 +112,19 @@ function cmd_sync {
     fi
 }
 
-# Pulls the latest changes from remote and merges them into the working tree
-function cmd_pull {
-    local payload response ok
-    payload=$(jq -n '{"cmd": "pull", "args": []}')
-
-    response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
-    ok=$(echo "$response" | jq -r '.ok')
-
-    if [[ "$ok" == "true" ]]; then
-        echo "${GRN}Successfully updated from remote${RST}"
-    elif [[ "$ok" == "false" ]]; then
-        die "$(echo "$response" | jq -r '.output')"
-    else
-        die "Malformed response from configzd"
+# Permanently deletes the local bare repo and all configz data
+function cmd_purge {
+    printf "Are you sure? ${RED}(Any changes not pushed will be lost forever)${RST}\n[YES]: "
+    read -r confirm
+    if [[ "$confirm" != "YES" ]]; then
+        echo "Purge cancelled."
+        return 0
     fi
-}
 
-# Fetches latest changes from remote without merging into the working tree
-function cmd_fetch {
-    local payload response ok
-    payload=$(jq -n '{"cmd": "fetch", "args": []}')
-
-    response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
-    ok=$(echo "$response" | jq -r '.ok')
-
-    if [[ "$ok" == "true" ]]; then
-        echo "$response" | jq -r '.output'
-    elif [[ "$ok" == "false" ]]; then
-        die "$(echo "$response" | jq -r '.output')"
-    else
-        die "Malformed response from configzd"
-    fi
+    pkill -TERM configzd || true
+    rm -f "$XDG_RUNTIME_DIR/configz.sock"
+    rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/configz"
+    echo -e "${GRN}Local repo purged successfully${RST}"
 }
 
 # Initializes a new bare repo at the default location and sets the given remote
@@ -154,7 +132,7 @@ function cmd_init {
     [[ $# -gt 0 ]] || die "usage: configz init <remote>"
 
     local payload response ok
-    payload=$(jq -n \
+    payload=$(jq -cn \
         --arg remote "$1" \
         '{"cmd": "init", "args": [$remote]}')
 
@@ -162,7 +140,7 @@ function cmd_init {
     ok=$(echo "$response" | jq -r '.ok')
 
     if [[ "$ok" == "true" ]]; then
-        echo "${GRN}Successfully initialized${RST}"
+        echo -e "${GRN}Successfully initialized${RST}"
     elif [[ "$ok" == "false" ]]; then
         die "$(echo "$response" | jq -r '.output')"
     else
@@ -173,7 +151,7 @@ function cmd_init {
 # Passes arguments directly to git, allowing full access to git's command set
 function cmd_git {
     local payload response ok
-    payload=$(jq -n \
+    payload=$(jq -cn \
         --args '{"cmd": "git", "args": $ARGS.positional}' \
         -- "$@")
 
@@ -181,28 +159,8 @@ function cmd_git {
     ok=$(echo "$response" | jq -r '.ok')
 
     if [[ "$ok" == "true" ]]; then
-        echo "$response" | jq -r '.output'
-    elif [[ "$ok" == "false" ]]; then
-        die "$(echo "$response" | jq -r '.output')"
-    else
-        die "Malformed response from configzd"
-    fi
-}
-
-# Shows unstaged changes for a specific file or all tracked files if 'all' is given
-function cmd_diff {
-    local payload response ok
-    payload=$(jq -n \
-        --args '{"cmd": "diff", "args": $ARGS.positional}' \
-        -- "$@")
-
-    response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
-    ok=$(echo "$response" | jq -r '.ok')
-
-    if [[ "$ok" == "true" ]]; then
-        echo "$response" | jq -r '.output'
-    elif [[ "$ok" == "false" ]]; then
-        die "$(echo "$response" | jq -r '.output')"
+        printf '%s' "$(echo "$response" | jq -r '.output.out')"
+        printf '%s' "$(echo "$response" | jq -r '.output.err')" 1>&2
     else
         die "Malformed response from configzd"
     fi
@@ -212,18 +170,23 @@ function cmd_diff {
 function cmd_add {
     [[ $# -gt 0 ]] || die "usage: configz add <file> [file...]"
 
+    local resolved=()
+    for f in "$@"; do
+        resolved+=("$(resolve_path "$f")")
+    done
+
     local payload response ok
-    payload=$(jq -n \
+    payload=$(jq -cn \
         --args '{"cmd": "add", "args": $ARGS.positional}' \
-        -- "$@")
+        -- "${resolved[@]}")
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
     ok=$(echo "$response" | jq -r '.ok')
 
     if [[ "$ok" == "true" ]]; then
-        echo "${GRN}Successfully added files${RST}"
+        echo -e "${GRN}Successfully added files${RST}"
     elif [[ "$ok" == "false" ]]; then
-        die "some files failed to add:"$'\n'"$(echo "$response" | jq -r '.output[] | "\(.file): \(.reason)"')"
+        die "$(echo "$response" | jq -r '.output')"
     else
         die "Malformed response from configzd"
     fi
@@ -233,18 +196,23 @@ function cmd_add {
 function cmd_drop {
     [[ $# -gt 0 ]] || die "usage: configz drop <file> [file...]"
 
+    local resolved=()
+    for f in "$@"; do
+        resolved+=("$(resolve_path "$f")")
+    done
+
     local payload response ok
-    payload=$(jq -n \
+    payload=$(jq -cn \
         --args '{"cmd": "drop", "args": $ARGS.positional}' \
-        -- "$@")
+        -- "${resolved[@]}")
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
     ok=$(echo "$response" | jq -r '.ok')
 
     if [[ "$ok" == "true" ]]; then
-        echo "${GRN}Successfully dropped files${RST}"
+        echo -e "${GRN}Successfully dropped files${RST}"
     elif [[ "$ok" == "false" ]]; then
-        die "some files failed to be dropped:"$'\n'"$(echo "$response" | jq -r '.output[] | "\(.file): \(.reason)"')"
+        die "$(echo "$response" | jq -r '.output')"
     else
         die "Malformed response from configzd"
     fi
@@ -258,14 +226,11 @@ function show_help {
     echo
     echo "Commands:"
     echo "    configz                        — Show status of tracked dotfile changes"
-    echo "    configz log                    — Show recent commit history"
     echo "    configz sync                   — Commit and push all tracked changes"
     echo "        -m <message>                   — Attach a commit message"
-    echo "    configz pull                   — Pull latest changes from remote"
-    echo "    configz fetch                  — Fetch latest changes from remote"
+    echo "    configz purge                  — Permanently delete the local repo and all data"
     echo "    configz init <remote>          — Initialize bare repo and set remote"
     echo "    configz git -- <args>          — Pass commands directly to git"
-    echo "    configz diff <file|all>        — Show unstaged changes for a file or all"
     echo "    configz add <file> [file...]   — Begin tracking a file"
     echo "    configz drop <file> [file...]  — Stop tracking a file"
 }
@@ -282,35 +247,28 @@ case "${1:-}" in
     ""|status)
         cmd_status
         ;;
-    log)
-        shift; cmd_log "$@"
-        ;;
     sync)
         shift; cmd_sync "$@"
         ;;
-    pull)
-        shift; cmd_pull "$@"
-        ;;
-    fetch)
-        shift; cmd_fetch "$@"
-        ;;
-    add)
-        shift; cmd_add "$@"
-        ;;
-    drop)
-        shift; cmd_drop "$@"
+    purge)
+        shift; cmd_purge "$@"
         ;;
     init)
         shift; cmd_init "$@"
         ;;
     git)
         shift
-        [[ $# -gt 0 && "$1" == "--" ]] || die "expected '--' before git arguments"$'\n'"Usage: configz git -- <args>"
+        if [[ $# -eq 0 || "$1" != "--" ]]; then
+            die "expected '--' before git arguments"$'\n'"Usage: configz git -- <args>"
+        fi
         shift
         cmd_git "$@"
         ;;
-    diff)
-        shift; cmd_diff "$@"
+    add)
+        shift; cmd_add "$@"
+        ;;
+    drop)
+        shift; cmd_drop "$@"
         ;;
     help|--help|-h)
         show_help

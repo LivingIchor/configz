@@ -3,15 +3,15 @@ const clap = @import("clap");
 const config = @import("config.zig");
 const cmds = @import("commands.zig");
 
+const c = @cImport({
+    @cInclude("git2.h");
+});
+
 const Command = enum {
     status,
-    log,
     sync,
-    pull,
-    fetch,
     init,
     git,
-    diff,
     add,
     drop,
 };
@@ -21,7 +21,19 @@ const Request = struct {
     args: []const []const u8,
 };
 
+fn signalHandler(_: std.os.linux.SIG) callconv(.c) void {
+    std.process.exit(0);
+}
 pub fn main(init: std.process.Init) !void {
+    var sa = std.os.linux.Sigaction{
+        .handler = .{ .handler = signalHandler },
+        .mask = std.os.linux.sigemptyset(),
+        .flags = 0,
+    };
+    _ = std.os.linux.sigaction(std.os.linux.SIG.INT, &sa, null);
+    _ = std.os.linux.sigaction(std.os.linux.SIG.TERM, &sa, null);
+
+
     var argv = std.process.Args.iterate(init.minimal.args);
     const procname = argv.next().?;
     const errbuf = try init.gpa.alloc(u8, 1024);
@@ -57,6 +69,9 @@ pub fn main(init: std.process.Init) !void {
     if (res.args.daemon != 0)
         try daemonize(init);
 
+    _ = c.git_libgit2_init();
+    defer _ = c.git_libgit2_shutdown();
+
     const runtime = init.minimal.environ.getAlloc(init.gpa, "XDG_RUNTIME_DIR") catch |err| {
         if (err == error.EnvironmentVariableMissing) {
             std.log.err("XDG_RUNTIME_DIR is not set", .{});
@@ -65,105 +80,159 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     defer init.gpa.free(runtime);
-    const socket_path = try std.fmt.allocPrint(init.gpa, config.socket_path_fmt, runtime);
+    const socket_path = try std.fmt.allocPrint(init.gpa, config.socket_path_fmt, .{runtime});
     defer init.gpa.free(socket_path);
     const address = try std.Io.net.UnixAddress.init(socket_path);
-    var server = try address.listen();
-    defer server.deinit();
+
+    // Remove stale socket if it exists
+    std.Io.Dir.deleteFileAbsolute(init.io, socket_path) catch |err| switch (err) {
+        error.FileNotFound => {}, // fine, doesn't exist
+        else => return err,
+    };
+    var server = try address.listen(init.io, .{});
+    defer server.deinit(init.io);
 
     const sreadbuf = try init.gpa.alloc(u8, 1024);
     defer init.gpa.free(sreadbuf);
     const swritebuf = try init.gpa.alloc(u8, 1024);
     defer init.gpa.free(swritebuf);
     while (true) {
-        const connection = try server.accept();
-        defer connection.close();
+        const connection = try server.accept(init.io);
+        defer connection.close(init.io);
 
         var stream_reader = connection.reader(init.io, sreadbuf);
         var streamin = &stream_reader.interface;
         var stream_writer = connection.writer(init.io, swritebuf);
         const streamout = &stream_writer.interface;
 
-        const json_str = streamin.takeDelimiter('\n');
-        const cmd_json = try std.json.parseFromSlice(std.json.Value, init.gpa, json_str, .{});
-        defer cmd_json.deinit();
+        const json_str = try streamin.takeDelimiter('\n') orelse continue;
+        const json_trimmed = std.mem.trimEnd(u8, json_str, "\n");
+        std.log.debug("Received len={d}: '{s}'", .{json_trimmed.len, json_trimmed});
+        if (json_trimmed.len == 0) continue;
 
-        const parsed = try std.json.parseFromSlice(Request, init.gpa, json_str, .{});
+        const parsed = try std.json.parseFromSlice(Request, init.gpa, json_trimmed, .{});
         defer parsed.deinit();
 
+        var err_msg: []const u8 = "";
         switch (parsed.value.cmd) {
             .status => {
-                if (parsed.value.args.len > 0)
+                if (parsed.value.args.len > 0) {
                     try sendError(streamout, "status doesn't take arguments");
+                    continue;
+                }
 
-                try cmds.handleStatus();
-            },
-            .log => {
-                if (parsed.value.args.len > 0)
-                    try sendError(streamout, "log doesn't take arguments");
+                cmds.handleStatus(init, &err_msg) catch {
+                    try sendError(streamout, err_msg);
+                    continue;
+                };
 
-                try cmds.handleLog();
+                var stringify = std.json.Stringify{.writer = streamout};
+                try stringify.write(.{ .ok = true, .output = err_msg });
+                try streamout.writeByte('\n');
+                try streamout.flush();
             },
             .sync => {
-                if (parsed.value.args.len < 1)
-                    try sendError(streamout, "sync doesn't requires a subject")
-                else if (parsed.value.args.len > 2)
+                if (parsed.value.args.len < 1) {
+                    try sendError(streamout, "sync doesn't requires a subject");
+                    continue;
+                } else if (parsed.value.args.len > 2) {
                     try sendError(streamout, "sync can only take a subject and body text");
+                    continue;
+                }
 
-                const subject = parsed.value.args[0];
-                const body = if (parsed.value.args.len == 2) parsed.value.args[1] else null;
+                const subject = try init.gpa.dupeSentinel(u8, parsed.value.args[0], 0);
+                defer init.gpa.free(subject);
+                const body = if (parsed.value.args.len == 2)
+                    try init.gpa.dupeSentinel(u8, parsed.value.args[1], 0)
+                else null;
+                defer if (body) |b| init.gpa.free(b);
 
-                try cmds.handleSync(subject, body);
-            },
-            .pull => {
-                if (parsed.value.args.len > 0)
-                    try sendError(streamout, "pull doesn't take arguments");
+                cmds.handleSync(init, subject, body, &err_msg) catch {
+                    try sendError(streamout, err_msg);
+                    continue;
+                };
 
-                try cmds.handlePull();
-            },
-            .fetch => {
-                if (parsed.value.args.len > 0)
-                    try sendError(streamout, "fetch doesn't take arguments");
-
-                try cmds.handleFetch();
+                try sendSuccess(streamout);
             },
             .init => {
-                if (parsed.value.args.len != 1)
+                if (parsed.value.args.len != 1) {
                     try sendError(streamout, "init requires one remote URL");
+                    continue;
+                }
 
-                try cmds.handleInit(parsed.value.args[0]);
+                const remote = try init.gpa.dupeSentinel(u8, parsed.value.args[0], 0);
+                defer init.gpa.free(remote);
+
+                cmds.handleInit(init, remote, &err_msg) catch {
+                    const msg: []const u8 = err_msg;
+                    try sendError(streamout, msg);
+                    continue;
+                };
+
+                try sendSuccess(streamout);
             },
             .git => {
-                if (parsed.value.args.len < 1)
+                if (parsed.value.args.len < 1) {
                     try sendError(streamout, "git requires at least one argument");
+                    continue;
+                }
 
-                try cmds.handleGit(parsed.value.args);
-            },
-            .diff => {
-                if (parsed.value.args.len < 1)
-                    try sendError(streamout, "diff requires at least one file");
+                var out: []const u8 = "";
+                var err: []const u8 = "";
+                try cmds.handleGit(init, parsed.value.args, &out, &err);
 
-                try cmds.handleDiff(parsed.value.args);
+                var stringify = std.json.Stringify{.writer = streamout};
+                try stringify.write(.{ .ok = true, .output = .{
+                    .out = @as([]const u8, out),
+                    .err = @as([]const u8, err),
+                }});
+                try streamout.writeByte('\n');
+                try streamout.flush();
             },
             .add => {
-                if (parsed.value.args.len < 1)
+                if (parsed.value.args.len < 1) {
                     try sendError(streamout, "add requires at least one file");
+                    continue;
+                }
 
-                try cmds.handleAdd(parsed.value.args);
+                cmds.handleAdd(init, parsed.value.args, &err_msg) catch {
+                    const msg: []const u8 = err_msg;
+                    try sendError(streamout, msg);
+                    continue;
+                };
+
+                try sendSuccess(streamout);
             },
             .drop => {
-                if (parsed.value.args.len < 1)
+                if (parsed.value.args.len < 1) {
                     try sendError(streamout, "drop requires at least one file");
+                    continue;
+                }
 
-                try cmds.handleDrop(parsed.value.args);
+                cmds.handleDrop(init, parsed.value.args, &err_msg) catch {
+                    const msg: []const u8 = err_msg;
+                    try sendError(streamout, msg);
+                    continue;
+                };
+
+                try sendSuccess(streamout);
             },
         }
     }
 }
 
-fn sendError(writer: std.Io.Writer, msg: []const u8) !void {
-    try std.json.stringify(.{ .ok = false, .output = msg }, .{}, writer);
+fn sendSuccess(writer: *std.Io.Writer) !void {
+    var stringify = std.json.Stringify{.writer = writer};
+    try stringify.write(.{ .ok = true, .output = "" });
     try writer.writeByte('\n');
+    try writer.flush();
+}
+
+fn sendError(writer: *std.Io.Writer, msg: []const u8) !void {
+    var stringify = std.json.Stringify{.writer = writer};
+    try stringify.write(.{ .ok = false, .output = msg });
+    try writer.writeByte('\n');
+    try writer.flush();
 }
 
 fn daemonize(init: std.process.Init) !void {
