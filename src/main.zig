@@ -1,11 +1,9 @@
 const std = @import("std");
+const c = @import("c.zig").git2;
 const clap = @import("clap");
 const config = @import("config.zig");
 const cmds = @import("commands.zig");
-
-const c = @cImport({
-    @cInclude("git2.h");
-});
+const auto = @import("auto.zig");
 
 const Command = enum {
     status,
@@ -24,6 +22,7 @@ const Request = struct {
 fn signalHandler(_: std.os.linux.SIG) callconv(.c) void {
     std.process.exit(0);
 }
+
 pub fn main(init: std.process.Init) !void {
     var sa = std.os.linux.Sigaction{
         .handler = .{ .handler = signalHandler },
@@ -32,7 +31,6 @@ pub fn main(init: std.process.Init) !void {
     };
     _ = std.os.linux.sigaction(std.os.linux.SIG.INT, &sa, null);
     _ = std.os.linux.sigaction(std.os.linux.SIG.TERM, &sa, null);
-
 
     var argv = std.process.Args.iterate(init.minimal.args);
     const procname = argv.next().?;
@@ -84,6 +82,20 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(socket_path);
     const address = try std.Io.net.UnixAddress.init(socket_path);
 
+    const home = std.c.getenv("HOME").?;
+    const repo_path = try std.fmt.allocPrintSentinel(init.gpa, config.bare_repo_path_fmt, .{home}, 0);
+    defer init.gpa.free(repo_path);
+
+    var no_repo = false;
+    var repo: ?*c.git_repository = null;
+    if (c.git_repository_open(&repo, repo_path) != 0) {
+        no_repo = true;
+    } else {
+        const thread = try std.Thread.spawn(.{}, auto.watchFiles, .{init, repo.?});
+        thread.detach();
+    }
+    defer if (repo) |r| c.git_repository_free(r);
+
     // Remove stale socket if it exists
     std.Io.Dir.deleteFileAbsolute(init.io, socket_path) catch |err| switch (err) {
         error.FileNotFound => {}, // fine, doesn't exist
@@ -113,6 +125,11 @@ pub fn main(init: std.process.Init) !void {
         const parsed = try std.json.parseFromSlice(Request, init.gpa, json_trimmed, .{});
         defer parsed.deinit();
 
+        if (no_repo and parsed.value.cmd != .init) {
+            try sendError(streamout, "repo not initialized, run 'configz init <remote>' first");
+            continue;
+        }
+
         var err_msg: []const u8 = "";
         switch (parsed.value.cmd) {
             .status => {
@@ -121,7 +138,7 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 }
 
-                cmds.handleStatus(init, &err_msg) catch {
+                cmds.handleStatus(init, repo, &err_msg) catch {
                     try sendError(streamout, err_msg);
                     continue;
                 };
@@ -147,7 +164,7 @@ pub fn main(init: std.process.Init) !void {
                 else null;
                 defer if (body) |b| init.gpa.free(b);
 
-                cmds.handleSync(init, subject, body, &err_msg) catch {
+                cmds.handleSync(init, repo, subject, body, &err_msg) catch {
                     try sendError(streamout, err_msg);
                     continue;
                 };
@@ -155,6 +172,11 @@ pub fn main(init: std.process.Init) !void {
                 try sendSuccess(streamout);
             },
             .init => {
+                if (!no_repo) {
+                    try sendError(streamout, "repo already initialized");
+                    continue;
+                }
+
                 if (parsed.value.args.len != 1) {
                     try sendError(streamout, "init requires one remote URL");
                     continue;
@@ -163,13 +185,16 @@ pub fn main(init: std.process.Init) !void {
                 const remote = try init.gpa.dupeSentinel(u8, parsed.value.args[0], 0);
                 defer init.gpa.free(remote);
 
-                cmds.handleInit(init, remote, &err_msg) catch {
+                cmds.handleInit(init, &repo, remote, &err_msg) catch {
                     const msg: []const u8 = err_msg;
                     try sendError(streamout, msg);
                     continue;
                 };
 
                 try sendSuccess(streamout);
+
+                const thread = try std.Thread.spawn(.{}, auto.watchFiles, .{init, repo.?});
+                thread.detach();
             },
             .git => {
                 if (parsed.value.args.len < 1) {
@@ -195,7 +220,7 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 }
 
-                cmds.handleAdd(init, parsed.value.args, &err_msg) catch {
+                cmds.handleAdd(init, repo, parsed.value.args, &err_msg) catch {
                     const msg: []const u8 = err_msg;
                     try sendError(streamout, msg);
                     continue;
@@ -209,7 +234,7 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 }
 
-                cmds.handleDrop(init, parsed.value.args, &err_msg) catch {
+                cmds.handleDrop(init, repo, parsed.value.args, &err_msg) catch {
                     const msg: []const u8 = err_msg;
                     try sendError(streamout, msg);
                     continue;

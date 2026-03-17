@@ -1,22 +1,8 @@
 const std = @import("std");
+const c = @import("c.zig").git2;
 const config = @import("config.zig");
 
-const c = @cImport({
-    @cInclude("git2.h");
-});
-
-pub fn handleStatus(init: std.process.Init, msg: *[]const u8) !void {
-    const home = std.c.getenv("HOME").?;
-    const repo_path = try std.fmt.allocPrintSentinel(init.gpa, config.bare_repo_path_fmt, .{home}, 0);
-    defer init.gpa.free(repo_path);
-
-    var repo: ?*c.git_repository = null;
-    if (c.git_repository_open(&repo, repo_path) != 0) {
-        msg.* = try init.gpa.dupe(u8, "repo not initialized, run 'configz init <remote>' first");
-        return error.NoRepo;
-    }
-    defer c.git_repository_free(repo);
-
+pub fn handleStatus(init: std.process.Init, repo: ?*c.git_repository, msg: *[]const u8) !void {
     var status_list: ?*c.git_status_list = null;
     var opts: c.git_status_options = undefined;
     _ = c.git_status_options_init(&opts, c.GIT_STATUS_OPTIONS_VERSION);
@@ -117,18 +103,13 @@ pub fn handleStatus(init: std.process.Init, msg: *[]const u8) !void {
     msg.* = try init.gpa.dupe(u8, if (result) |res| res else "");
 }
 
-pub fn handleSync(init: std.process.Init, subject: []const u8, body: ?[]const u8, err_msg: *[]const u8) !void {
-    const home = std.c.getenv("HOME").?;
-    const repo_path = try std.fmt.allocPrintSentinel(init.gpa, config.bare_repo_path_fmt, .{home}, 0);
-    defer init.gpa.free(repo_path);
-
-    var repo: ?*c.git_repository = null;
-    if (c.git_repository_open_bare(&repo, repo_path) != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "repo not initialized, run 'configz init <remote>' first");
-        return error.NoRepo;
-    }
-    defer c.git_repository_free(repo);
-
+pub fn handleSync(
+    init: std.process.Init,
+    repo: ?*c.git_repository,
+    subject: []const u8,
+    body: ?[]const u8,
+    err_msg: *[]const u8
+) !void {
     var index: ?*c.git_index = null;
     if (c.git_repository_index(&index, repo) != 0) {
         err_msg.* = try init.gpa.dupe(u8, "failed to get repo index");
@@ -193,7 +174,12 @@ pub fn handleSync(init: std.process.Init, subject: []const u8, body: ?[]const u8
     }
 }
 
-pub fn handleInit(init: std.process.Init, remote: []const u8, err_msg: *[]const u8) !void {
+pub fn handleInit(
+    init: std.process.Init,
+    repo: *?*c.git_repository,
+    remote: []const u8,
+    err_msg: *[]const u8
+) !void {
     const remote_z = try init.gpa.dupeSentinel(u8, remote, 0);
     defer init.gpa.free(remote_z);
 
@@ -201,40 +187,36 @@ pub fn handleInit(init: std.process.Init, remote: []const u8, err_msg: *[]const 
     const repo_path = try std.fmt.allocPrintSentinel(init.gpa, config.bare_repo_path_fmt, .{home}, 0);
     defer init.gpa.free(repo_path);
 
-    var repo: ?*c.git_repository = null;
-    const already_exists = c.git_repository_open_bare(&repo, repo_path) == 0;
-    if (!already_exists) {
-        const init_err = c.git_repository_init(&repo, repo_path, 1);
-        if (init_err != 0) {
-            err_msg.* = try init.gpa.dupe(u8, "failed to create bare repo");
-            return error.GitError;
-        }
-        defer c.git_repository_free(repo);
-
-        _ = c.git_repository_set_workdir(repo, home, 0);
-
-        var remote_obj: ?*c.git_remote = null;
-        const remote_err = c.git_remote_create(&remote_obj, repo, "origin", remote_z);
-        if (remote_err != 0) {
-            err_msg.* = try init.gpa.dupe(u8, "failed to create remote");
-            return error.GitError;
-        }
-        defer c.git_remote_free(remote_obj);
-
-        var cfg: ?*c.git_config = null;
-        _ = c.git_repository_config(&cfg, repo);
-        defer c.git_config_free(cfg);
-        _ = c.git_config_set_bool(cfg, "core.bare", 0);
-        _ = c.git_config_set_string(cfg, "core.worktree", home);
-        _ = c.git_config_set_string(cfg, "status.showUntrackedFiles", "no");
-    } else {
-        defer c.git_repository_free(repo);
-        err_msg.* = try init.gpa.dupe(u8, "repo already initialized");
-        return error.AlreadyInitialized;
+    const init_err = c.git_repository_init(repo, repo_path, 1);
+    if (init_err != 0) {
+        err_msg.* = try init.gpa.dupe(u8, "failed to create bare repo");
+        return error.GitError;
     }
+
+    _ = c.git_repository_set_workdir(repo.*, home, 0);
+
+    var remote_obj: ?*c.git_remote = null;
+    const remote_err = c.git_remote_create(&remote_obj, repo.*, "origin", remote_z);
+    if (remote_err != 0) {
+        err_msg.* = try init.gpa.dupe(u8, "failed to create remote");
+        return error.GitError;
+    }
+    defer c.git_remote_free(remote_obj);
+
+    var cfg: ?*c.git_config = null;
+    _ = c.git_repository_config(&cfg, repo.*);
+    defer c.git_config_free(cfg);
+    _ = c.git_config_set_bool(cfg, "core.bare", 0);
+    _ = c.git_config_set_string(cfg, "core.worktree", home);
+    _ = c.git_config_set_string(cfg, "status.showUntrackedFiles", "no");
 }
 
-pub fn handleGit(init: std.process.Init, args: []const []const u8, out: *[]const u8, err: *[]const u8) !void {
+pub fn handleGit(
+    init: std.process.Init,
+    args: []const []const u8,
+    out: *[]const u8,
+    err: *[]const u8
+) !void {
     const home = try init.minimal.environ.getAlloc(init.gpa, "HOME");
     const repo_path = try std.fmt.allocPrint(init.gpa, config.bare_repo_path_fmt, .{home});
     defer init.gpa.free(repo_path);
@@ -278,17 +260,15 @@ pub fn handleGit(init: std.process.Init, args: []const []const u8, out: *[]const
     out.* = try init.gpa.dupe(u8, stdout.buffered());
 }
 
-pub fn handleAdd(init: std.process.Init, args: []const []const u8, err_msg: *[]const u8) !void {
+pub fn handleAdd(
+    init: std.process.Init,
+    repo: ?*c.git_repository,
+    args: []const []const u8,
+    err_msg: *[]const u8
+) !void {
     const home = std.c.getenv("HOME").?;
     const repo_path = try std.fmt.allocPrintSentinel(init.gpa, config.bare_repo_path_fmt, .{home}, 0);
     defer init.gpa.free(repo_path);
-
-    var repo: ?*c.git_repository = null;
-    if (c.git_repository_open_bare(&repo, repo_path) != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "repo not initialized, run 'configz init <remote>' first");
-        return error.NoRepo;
-    }
-    defer c.git_repository_free(repo);
 
     // Get the index
     var index: ?*c.git_index = null;
@@ -373,17 +353,15 @@ fn addPath(
     }
 }
 
-pub fn handleDrop(init: std.process.Init, args: []const []const u8, err_msg: *[]const u8) !void {
+pub fn handleDrop(
+    init: std.process.Init,
+    repo: ?*c.git_repository,
+    args: []const []const u8,
+    err_msg: *[]const u8
+) !void {
     const home = std.c.getenv("HOME").?;
     const repo_path = try std.fmt.allocPrintSentinel(init.gpa, config.bare_repo_path_fmt, .{home}, 0);
     defer init.gpa.free(repo_path);
-
-    var repo: ?*c.git_repository = null;
-    if (c.git_repository_open_bare(&repo, repo_path) != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "repo not initialized, run 'configz init <remote>' first");
-        return error.NoRepo;
-    }
-    defer c.git_repository_free(repo);
 
     var index: ?*c.git_index = null;
     if (c.git_repository_index(&index, repo) != 0) {
@@ -458,7 +436,6 @@ fn dropPath(
         entry.mtime.nanoseconds = @intCast(statx_buf.mtime.nsec);
         entry.ctime.seconds = @intCast(statx_buf.ctime.sec);
         entry.ctime.nanoseconds = @intCast(statx_buf.ctime.nsec);
-
 
         if (c.git_index_remove(index, file_z, 0) != 0) {
             pos.* += (try std.fmt.bufPrint(buf[pos.*..], "\n ~> {s}: failed to remove", .{rel_path})).len;
