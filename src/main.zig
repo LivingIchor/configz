@@ -88,10 +88,14 @@ pub fn main(init: std.process.Init) !void {
 
     var no_repo = false;
     var repo: ?*c.git_repository = null;
+    var pipe_fds: [2]i32 = undefined;
+    _ = std.os.linux.pipe(&pipe_fds);
+    const pipe_read_fd = pipe_fds[0];
+    const pipe_write_fd = pipe_fds[1];
     if (c.git_repository_open(&repo, repo_path) != 0) {
         no_repo = true;
     } else {
-        const thread = try std.Thread.spawn(.{}, auto.watchFiles, .{init, repo.?});
+        const thread = try std.Thread.spawn(.{}, auto.watchFiles, .{init, repo.?, pipe_read_fd});
         thread.detach();
     }
     defer if (repo) |r| c.git_repository_free(r);
@@ -193,7 +197,7 @@ pub fn main(init: std.process.Init) !void {
 
                 try sendSuccess(streamout);
 
-                const thread = try std.Thread.spawn(.{}, auto.watchFiles, .{init, repo.?});
+                const thread = try std.Thread.spawn(.{}, auto.watchFiles, .{init, repo.?, pipe_read_fd});
                 thread.detach();
             },
             .git => {
@@ -220,11 +224,20 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 }
 
-                cmds.handleAdd(init, repo, parsed.value.args, &err_msg) catch {
+                var added_paths = try std.ArrayList([]const u8)
+                    .initCapacity(init.gpa, parsed.value.args.len);
+                defer added_paths.deinit(init.gpa);
+
+                cmds.handleAdd(init, repo, parsed.value.args, &err_msg, &added_paths) catch {
                     const msg: []const u8 = err_msg;
                     try sendError(streamout, msg);
                     continue;
                 };
+
+                for (added_paths.items) |file| {
+                    const cmd = auto.WatchCmd{ .op = .add, .path = file };
+                    _ = std.os.linux.write(pipe_write_fd, @ptrCast(&cmd), @sizeOf(auto.WatchCmd));
+                }
 
                 try sendSuccess(streamout);
             },
@@ -234,11 +247,20 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 }
 
-                cmds.handleDrop(init, repo, parsed.value.args, &err_msg) catch {
+                var dropped_paths = try std.ArrayList([]const u8)
+                    .initCapacity(init.gpa, parsed.value.args.len);
+                defer dropped_paths.deinit(init.gpa);
+
+                cmds.handleDrop(init, repo, parsed.value.args, &err_msg, &dropped_paths) catch {
                     const msg: []const u8 = err_msg;
                     try sendError(streamout, msg);
                     continue;
                 };
+
+                for (dropped_paths.items) |file| {
+                    const cmd = auto.WatchCmd{ .op = .remove, .path = file };
+                    _ = std.os.linux.write(pipe_write_fd, @ptrCast(&cmd), @sizeOf(auto.WatchCmd));
+                }
 
                 try sendSuccess(streamout);
             },

@@ -13,6 +13,11 @@
 
 set -euo pipefail
 
+# ── Global vars ───────────────────────────────────────────────────────────────
+
+WATCH_FILE="$HOME/.local/share/configz/watched_dirs"
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 # Ansi color formaters
@@ -51,6 +56,51 @@ function resolve_path {
     fi
     # Make relative to HOME
     echo "${path#"$HOME"/}"
+}
+
+# Syncs dirs into the watched_dirs file: mode is "add" or "drop"
+function sync_watched_dirs {
+    local mode="$1"
+    local watch_file="$2"
+    shift 2
+    local files=("$@")
+
+    # Filter to only actual directories
+    local dirs=()
+    for f in "${files[@]}"; do
+        if [[ -d "$f" ]]; then dirs+=("$f"); fi
+    done
+
+    if [[ ${#dirs[@]} -eq 0 ]]; then return 0; fi
+
+    # Read existing watched dirs from file
+    local existing=()
+    if [[ -f "$watch_file" ]]; then
+        mapfile -t existing < "$watch_file"
+    fi
+
+    if [[ "$mode" == "add" ]]; then
+        local new_entries=("${existing[@]}")
+        for dir in "${dirs[@]}"; do
+            local found=0
+            for e in "${existing[@]}"; do
+                if [[ "$e" == "$dir" ]]; then found=1 && break; fi
+            done
+            if [[ $found -eq 0 ]]; then new_entries+=("$dir"); fi
+        done
+        printf '%s\n' "${new_entries[@]}" > "$watch_file"
+
+    elif [[ "$mode" == "drop" ]]; then
+        local remaining=()
+        for e in "${existing[@]}"; do
+            local remove=0
+            for dir in "${dirs[@]}"; do
+                if [[ "$e" == "$dir" ]]; then remove=1 && break; fi
+            done
+            if [[ $remove -eq 0 ]]; then remaining+=("$e"); fi
+        done
+        printf '%s\n' "${remaining[@]}" > "$watch_file"
+    fi
 }
 
 
@@ -174,6 +224,7 @@ function cmd_add {
     for f in "$@"; do
         resolved+=("$(resolve_path "$f")")
     done
+    sync_watched_dirs "add" "$WATCH_FILE" "${resolved[@]}"
 
     local payload response ok
     payload=$(jq -cn \
@@ -200,6 +251,7 @@ function cmd_drop {
     for f in "$@"; do
         resolved+=("$(resolve_path "$f")")
     done
+    sync_watched_dirs "drop" "$WATCH_FILE" "${resolved[@]}"
 
     local payload response ok
     payload=$(jq -cn \

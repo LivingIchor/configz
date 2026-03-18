@@ -264,7 +264,8 @@ pub fn handleAdd(
     init: std.process.Init,
     repo: ?*c.git_repository,
     args: []const []const u8,
-    err_msg: *[]const u8
+    err_msg: *[]const u8,
+    added_paths: *std.ArrayList([]const u8)
 ) !void {
     const home = std.c.getenv("HOME").?;
     const repo_path = try std.fmt.allocPrintSentinel(init.gpa, config.bare_repo_path_fmt, .{home}, 0);
@@ -282,7 +283,8 @@ pub fn handleAdd(
     var buf: [4096]u8 = undefined;
     var pos: usize = 0;
     for (args) |file| {
-        try addPath(init, repo.?, index.?, home, file, &buf, &pos);
+        addPath(init, repo.?, index.?, home, file, &buf, &pos) catch continue;
+        try added_paths.append(init.gpa, try init.gpa.dupe(u8, file));
     }
     if (pos > 0) {
         err_msg.* = try std.fmt.allocPrint(init.gpa, "Some files failed to add:{s}", .{buf[0..pos]});
@@ -324,7 +326,7 @@ fn addPath(
         var oid: c.git_oid = undefined;
         if (c.git_blob_create_from_disk(&oid, repo, full_path) != 0) {
             pos.* += (try std.fmt.bufPrint(buf[pos.*..], "\n ~> {s}: failed to create blob", .{rel_path})).len;
-            return;
+            return error.GitError;
         }
 
         var statx_buf: std.os.linux.Statx = undefined;
@@ -349,6 +351,7 @@ fn addPath(
 
         if (c.git_index_add(index, &entry) != 0) {
             pos.* += (try std.fmt.bufPrint(buf[pos.*..], "\n ~> {s}: failed to add", .{rel_path})).len;
+            return error.GitError;
         }
     }
 }
@@ -357,7 +360,8 @@ pub fn handleDrop(
     init: std.process.Init,
     repo: ?*c.git_repository,
     args: []const []const u8,
-    err_msg: *[]const u8
+    err_msg: *[]const u8,
+    dropped_paths: *std.ArrayList([]const u8)
 ) !void {
     const home = std.c.getenv("HOME").?;
     const repo_path = try std.fmt.allocPrintSentinel(init.gpa, config.bare_repo_path_fmt, .{home}, 0);
@@ -373,7 +377,8 @@ pub fn handleDrop(
     var buf: [4096]u8 = undefined;
     var pos: usize = 0;
     for (args) |file| {
-        try dropPath(init, repo.?, index.?, home, file, &buf, &pos);
+        dropPath(init, repo.?, index.?, home, file, &buf, &pos) catch continue;
+        try dropped_paths.append(init.gpa, try init.gpa.dupe(u8, file));
     }
     if (pos > 0) {
         err_msg.* = try std.fmt.allocPrint(init.gpa, "Some files failed to be dropped:{s}", .{buf[0..pos]});
@@ -414,7 +419,7 @@ fn dropPath(
         var oid: c.git_oid = undefined;
         if (c.git_blob_create_from_disk(&oid, repo, full_path) != 0) {
             pos.* += (try std.fmt.bufPrint(buf[pos.*..], "\n ~> {s}: failed to create blob", .{rel_path})).len;
-            return;
+            return error.GitError;
         }
 
         var statx_buf: std.os.linux.Statx = undefined;
@@ -439,6 +444,7 @@ fn dropPath(
 
         if (c.git_index_remove(index, file_z, 0) != 0) {
             pos.* += (try std.fmt.bufPrint(buf[pos.*..], "\n ~> {s}: failed to remove", .{rel_path})).len;
+            return error.GitError;
         }
     }
 }
