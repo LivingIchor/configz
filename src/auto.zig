@@ -1,39 +1,46 @@
 const std = @import("std");
+const mem = std.mem;
 const c = @import("c.zig").git2;
 const config = @import("config.zig");
+const wtree = @import("watch-tree.zig");
 
 pub const WatchCmd = struct {
     op: enum { add, remove },
     path: []const u8,
 };
 
-const WatchDirStat = struct {
-    is_explicit: bool,
-    file_set: ?std.ArrayList([]const u8),
-};
 
 fn handleEvent(
-    allocator: std.mem.Allocator,
+    init: std.process.Init,
     event: *std.os.linux.inotify_event,
-    wd_dirhash: *std.AutoHashMap(usize, []const u8),
-    dir_stathash: *std.StringHashMap(WatchDirStat)
+    manifest_wd: i32,
+    watches: *wtree.Paths,
 ) !void {
-    _ = allocator;
+    _ = init;
     _ = event;
-    _ = wd_dirhash;
-    _ = dir_stathash;
+    _ = manifest_wd;
+    _ = watches;
 }
 
 fn handleCmd(
-    allocator: std.mem.Allocator,
+    init: std.process.Init,
     cmd: WatchCmd,
-    wd_dirhash: *std.AutoHashMap(usize, []const u8),
-    dir_stathash: *std.StringHashMap(WatchDirStat)
+    watches: *wtree.Paths,
 ) !void {
-    _ = allocator;
-    _ = cmd;
-    _ = wd_dirhash;
-    _ = dir_stathash;
+    const home = std.c.getenv("HOME").?;
+    const abs_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{mem.span(home), cmd.path});
+    defer init.gpa.free(abs_path);
+
+    if (cmd.op == .add) {
+        try watches.add(init.gpa, init.io, abs_path, null);
+
+        const opened = try std.Io.Dir.openFileAbsolute(init.io, abs_path, .{});
+        const statted = try opened.stat(init.io);
+        if (statted.kind == .directory) {
+        }
+    } else { // op == .remove
+        try watches.remove(init.gpa, init.io, abs_path);
+    }
 }
 
 pub fn watchFiles(init: std.process.Init, repo: *c.git_repository, pipe_read_fd: i32) !void {
@@ -42,6 +49,7 @@ pub fn watchFiles(init: std.process.Init, repo: *c.git_repository, pipe_read_fd:
     const repo_path = c.git_repository_path(repo);
     const wdirs_path = try std.fmt.allocPrint(
         init.gpa, "{s}/watched_dirs", .{repo_path});
+    defer init.gpa.free(wdirs_path);
 
     const wdirs_handle = try std.Io.Dir.createFileAbsolute(
         init.io, wdirs_path, .{.read = true, .truncate = false});
@@ -53,47 +61,20 @@ pub fn watchFiles(init: std.process.Init, repo: *c.git_repository, pipe_read_fd:
     var out_wdirs = wdirs_reader.interface;
     // var in_wdirs = wdirs_writer.interface;
 
-    var expl_stats = try getExplicitDirs(init.gpa, &out_wdirs);
-    var file_stats = try getTrackedFiles(init.gpa, repo);
-    var it = expl_stats.iterator();
-    while (it.next()) |entry| {
-        try file_stats.put(entry.key_ptr.*, entry.value_ptr.*);
-    }
-    expl_stats.deinit();
-    defer freeEntries(init.gpa, &file_stats);
+    var watches = try wtree.Paths.init(init.gpa, init.io, mem.span(home));
 
-    // Initialize inotify
-    const ifd: i32 = @intCast(std.os.linux.inotify_init1(std.os.linux.IN.NONBLOCK));
-
-    var wd_dirs = std.AutoHashMap(usize, []const u8).init(init.gpa);
-    defer wd_dirs.deinit();
-
-    // Add watches
-    var wd: usize = undefined;
-
-    // Add watch for the repo itself
-    wd = std.os.linux.inotify_add_watch(ifd, repo_path,
+    // Add watch for the watched_dirs itself
+    // Doesn't require to be put in watches
+    const manifest_wd: i32 = @intCast(std.os.linux.inotify_add_watch(watches.ifd, @ptrCast(wdirs_path),
         std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE |
         std.os.linux.IN.DELETE | std.os.linux.IN.MOVED_FROM |
-        std.os.linux.IN.MOVED_TO);
-    try wd_dirs.put(wd, std.mem.span(repo_path));
+        std.os.linux.IN.MOVED_TO));
 
-    // Add watches for all other tracked directories and files
-    var statit = file_stats.iterator();
-    while (statit.next()) |stat| {
-        const abs_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{home, stat.key_ptr.*});
-        defer init.gpa.free(abs_path);
-
-        wd = std.os.linux.inotify_add_watch(ifd, @ptrCast(&abs_path),
-            std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE |
-            std.os.linux.IN.DELETE | std.os.linux.IN.MOVED_FROM |
-            std.os.linux.IN.MOVED_TO);
-
-        try wd_dirs.put(wd, stat.key_ptr.*);
-    }
+    try addExplicitDirs(init, &watches, &out_wdirs);
+    try addTrackedFiles(init, &watches, repo);
 
     var fds = [_]std.os.linux.pollfd{
-        .{ .fd = ifd, .events = std.os.linux.POLL.IN, .revents = 0 },
+        .{ .fd = watches.ifd, .events = std.os.linux.POLL.IN, .revents = 0 },
         .{ .fd = pipe_read_fd, .events = std.os.linux.POLL.IN, .revents = 0 },
     };
 
@@ -103,14 +84,14 @@ pub fn watchFiles(init: std.process.Init, repo: *c.git_repository, pipe_read_fd:
         _ = std.os.linux.poll(&fds, fds.len, -1);
         if (fds[0].revents & std.os.linux.POLL.IN != 0) {
             // handle inotify events
-            const len = std.os.linux.read(ifd, &buf, buf.len);
+            const len = std.os.linux.read(watches.ifd, &buf, buf.len);
 
             // Parse events
             var offset: usize = 0;
             while (offset < len) {
                 const event: *std.os.linux.inotify_event = @ptrCast(@alignCast(&buf[offset]));
 
-                try handleEvent(init.gpa, event, &wd_dirs, &file_stats);
+                try handleEvent(init, event, manifest_wd, &watches);
 
                 offset += @sizeOf(std.os.linux.inotify_event) + event.len;
             }
@@ -123,37 +104,31 @@ pub fn watchFiles(init: std.process.Init, repo: *c.git_repository, pipe_read_fd:
                 if (n == 0 or n == std.math.maxInt(usize)) break; // EAGAIN or closed
 
                 // handle cmd
-                try handleCmd(init.gpa, cmd, &wd_dirs, &file_stats);
+                try handleCmd(init, cmd, &watches);
             }
         }
     }
 }
 
-fn getExplicitDirs(
-    allocator: std.mem.Allocator,
+fn addExplicitDirs(
+    init: std.process.Init,
+    watches: *wtree.Paths,
     manifest_reader: *std.Io.Reader
-) !std.StringHashMap(WatchDirStat) {
-    var dir_stats = std.StringHashMap(WatchDirStat).init(allocator);
-
+) !void {
     while (manifest_reader.takeSentinel('\n') catch |err| switch (err) {
         error.EndOfStream => null,
         else => return err,
     }) |dir| {
-        const dirname = try allocator.dupe(u8, dir);
-        const stat_entry = WatchDirStat{
-            .is_explicit = true,
-            .file_set = null,
-        };
-        try dir_stats.put(dirname, stat_entry);
+        const dirname = try init.gpa.dupe(u8, dir);
+        try watches.add(init.gpa, init.io, dirname, null);
     }
-
-    return dir_stats;
 }
 
-fn getTrackedFiles(
-    allocator: std.mem.Allocator,
+fn addTrackedFiles(
+    init: std.process.Init,
+    watches: *wtree.Paths,
     repo: *c.git_repository
-) !std.StringHashMap(WatchDirStat) {
+) !void {
     var index: ?*c.git_index = null;
     if (c.git_repository_index(&index, repo) != 0) return error.GitError;
     defer c.git_index_free(index);
@@ -161,63 +136,12 @@ fn getTrackedFiles(
     // Read latest index from disk
     _ = c.git_index_read(index, 1);
 
+    var i: usize = 0;
     const count = c.git_index_entrycount(index);
-    var dir_stats = std.StringHashMap(WatchDirStat).init(allocator);
-
-    var index_entry = c.git_index_get_byindex(index, 0);
-    var current_dirname: []const u8 = std.fs.path.dirname(std.mem.span(index_entry.*.path)) orelse "";
-    var file_set = try std.ArrayList([]const u8).initCapacity(allocator, 0);
-    try file_set.append(allocator, try allocator.dupe(
-        u8, std.fs.path.basename(std.mem.span(index_entry.*.path))));
-
-    var stat_entry = WatchDirStat{
-        .is_explicit = false,
-        .file_set = file_set,
-    };
-
-    try dir_stats.put(current_dirname, stat_entry);
-
-    var i: usize = 1;
     while (i < count) : (i += 1) {
-        index_entry = c.git_index_get_byindex(index, i);
-        const new_dirname: []const u8 = std.fs.path.dirname(std.mem.span(index_entry.*.path)) orelse "";
+        const index_entry = c.git_index_get_byindex(index, i);
+        const entry = try init.gpa.dupe(u8, std.mem.span(index_entry.*.path));
 
-        if (std.mem.eql(u8, current_dirname, new_dirname)) {
-            try file_set.append(allocator, try allocator.dupe(
-                u8, std.fs.path.basename(std.mem.span(index_entry.*.path))));
-        } else {
-            current_dirname = new_dirname;
-            file_set = try std.ArrayList([]const u8).initCapacity(allocator, 0);
-            try file_set.append(allocator, try allocator.dupe(
-                u8, std.fs.path.basename(std.mem.span(index_entry.*.path))));
-
-            stat_entry = WatchDirStat{
-                .is_explicit = false,
-                .file_set = file_set,
-            };
-
-            try dir_stats.put(current_dirname, stat_entry);
-        }
-    }
-
-    return dir_stats;
-}
-
-fn freeEntries(allocator: std.mem.Allocator, entries: *std.StringHashMap(WatchDirStat)) void {
-    defer entries.deinit();
-    var it = entries.iterator();
-    while (it.next()) |entry| {
-        const dirname = entry.key_ptr.*;
-        var watch_dir_stat = entry.value_ptr.*;
-
-        allocator.free(dirname);
-
-        if (watch_dir_stat.file_set) |set| {
-            var mset = set;
-            for (set.items) |dir| {
-                allocator.free(dir);
-            }
-            mset.deinit(allocator);
-        }
+        try watches.add(init.gpa, init.io, entry, null);
     }
 }
