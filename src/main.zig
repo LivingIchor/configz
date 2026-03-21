@@ -95,7 +95,8 @@ pub fn main(init: std.process.Init) !void {
     if (c.git_repository_open(&repo, repo_path) != 0) {
         no_repo = true;
     } else {
-        const thread = try std.Thread.spawn(.{}, auto.watchFiles, .{init, repo.?, pipe_read_fd});
+        const thread = try std.Thread.spawn(.{}, auto.watchFilesWrapper, .{init, repo.?, pipe_read_fd});
+
         thread.detach();
     }
     defer if (repo) |r| c.git_repository_free(r);
@@ -197,7 +198,9 @@ pub fn main(init: std.process.Init) !void {
 
                 try sendSuccess(streamout);
 
-                const thread = try std.Thread.spawn(.{}, auto.watchFiles, .{init, repo.?, pipe_read_fd});
+                const thread = try std.Thread.spawn(.{},
+                    auto.watchFilesWrapper, .{init, repo.?, pipe_read_fd});
+
                 thread.detach();
             },
             .git => {

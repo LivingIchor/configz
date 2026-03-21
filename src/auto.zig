@@ -27,8 +27,8 @@ fn handleCmd(
     cmd: WatchCmd,
     watches: *wtree.Paths,
 ) !void {
-    const home = std.c.getenv("HOME").?;
-    const abs_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{mem.span(home), cmd.path});
+    const home = mem.span(std.c.getenv("HOME").?);
+    const abs_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{home, cmd.path});
     defer init.gpa.free(abs_path);
 
     if (cmd.op == .add) {
@@ -43,10 +43,19 @@ fn handleCmd(
     }
 }
 
+pub fn watchFilesWrapper(init: std.process.Init, repo: *c.git_repository, pipe_read_fd: i32) void {
+    watchFiles(init, repo, pipe_read_fd) catch |err| {
+        std.log.err("watchFiles failed: {}", .{err});
+    };
+}
+
 pub fn watchFiles(init: std.process.Init, repo: *c.git_repository, pipe_read_fd: i32) !void {
-    const home = std.c.getenv("HOME").?;
+    std.log.info("watchFiles: starting", .{});
+    const home = mem.span(std.c.getenv("HOME").?);
 
     const repo_path = c.git_repository_path(repo);
+    std.log.info("watchFiles: repo path = {s}", .{std.mem.span(repo_path)});
+
     const wdirs_path = try std.fmt.allocPrint(
         init.gpa, "{s}/watched_dirs", .{repo_path});
     defer init.gpa.free(wdirs_path);
@@ -58,10 +67,8 @@ pub fn watchFiles(init: std.process.Init, repo: *c.git_repository, pipe_read_fd:
     // var writebuf = [_]u8{0} ** 1024;
     // var wdirs_writer = wdirs_handle.writer(init.io, &writebuf);
 
-    var out_wdirs = wdirs_reader.interface;
-    // var in_wdirs = wdirs_writer.interface;
-
-    var watches = try wtree.Paths.init(init.gpa, init.io, mem.span(home));
+    var watches = try wtree.Paths.init(init.gpa, init.io, home);
+    std.log.info("watchFiles: watches initialized, root = {s}", .{home});
 
     // Add watch for the watched_dirs itself
     // Doesn't require to be put in watches
@@ -70,8 +77,11 @@ pub fn watchFiles(init: std.process.Init, repo: *c.git_repository, pipe_read_fd:
         std.os.linux.IN.DELETE | std.os.linux.IN.MOVED_FROM |
         std.os.linux.IN.MOVED_TO));
 
-    try addExplicitDirs(init, &watches, &out_wdirs);
+    try addExplicitDirs(init, &watches, &wdirs_reader.interface);
+    std.log.info("watchFiles: explicit dirs added", .{});
+
     try addTrackedFiles(init, &watches, repo);
+    std.log.info("watchFiles: tracked files added", .{});
 
     var fds = [_]std.os.linux.pollfd{
         .{ .fd = watches.ifd, .events = std.os.linux.POLL.IN, .revents = 0 },
@@ -79,6 +89,7 @@ pub fn watchFiles(init: std.process.Init, repo: *c.git_repository, pipe_read_fd:
     };
 
     var buf: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
+    std.log.info("watchFiles: entering poll loop", .{});
     while (true) {
         // Read events or recieve watch commands
         _ = std.os.linux.poll(&fds, fds.len, -1);
@@ -129,6 +140,8 @@ fn addTrackedFiles(
     watches: *wtree.Paths,
     repo: *c.git_repository
 ) !void {
+    const home = mem.span(std.c.getenv("HOME").?);
+
     var index: ?*c.git_index = null;
     if (c.git_repository_index(&index, repo) != 0) return error.GitError;
     defer c.git_index_free(index);
@@ -140,8 +153,10 @@ fn addTrackedFiles(
     const count = c.git_index_entrycount(index);
     while (i < count) : (i += 1) {
         const index_entry = c.git_index_get_byindex(index, i);
-        const entry = try init.gpa.dupe(u8, std.mem.span(index_entry.*.path));
+        const rel_path = std.mem.span(index_entry.*.path);
+        const abs_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{home, rel_path});
+        defer init.gpa.free(abs_path);
 
-        try watches.add(init.gpa, init.io, entry, null);
+        try watches.add(init.gpa, init.io, abs_path, null);
     }
 }

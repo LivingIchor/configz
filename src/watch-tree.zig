@@ -143,19 +143,26 @@ pub const Paths = struct {
             return WatchError.PathNotUnderRoot;
         }
 
+        // Check root itself first
+        if (mem.eql(u8, root.abs_dirname, dirname))
+            return .{ .found = true, .node = root };
+
         var i: usize = 0;
         var children = root.children.items;
         var child: *PathNode = root;
-        while (i < children.len) : (i += 1) {
+        while (i < children.len) {
             child = children[i];
 
-            if (mem.eql(u8, child.abs_dirname, dirname)) {
+            if (mem.eql(u8, child.abs_dirname, dirname))
                 return .{ .found = true, .node = child };
-            }
-            if (mem.eql(u8, child.abs_dirname, dirname[0..child.abs_dirname.len])) {
+            if (child.abs_dirname.len <= dirname.len and
+                mem.eql(u8, child.abs_dirname, dirname[0..child.abs_dirname.len])) {
                 children = child.children.items;
                 i = 0; // restart with new children
+                continue;
             }
+
+            i += 1;
         }
 
         return .{ .found = false, .node = child.parent orelse root };
@@ -185,18 +192,26 @@ pub const Paths = struct {
         return paths;
     }
 
-    pub fn deinit(self: *Self, allocator: Allocator) !void {
-        var it = self.hashes.wd_node.iterator();
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        var it = self.hashes.path_node.iterator();
         while (it.next()) |this| {
-            this.value_ptr.deinit(allocator, self.ifd);
-        }
-        it = self.hashes.path_node.iterator();
-        while (it.next()) |this| {
-            this.value_ptr.deinit(allocator, self.ifd);
+            allocator.free(this.key_ptr.*);
+            this.value_ptr.*.deinit(allocator, self.ifd) catch {};
+            allocator.destroy(this.value_ptr.*);
         }
 
         self.hashes.wd_node.deinit();
         self.hashes.path_node.deinit();
+
+        // Root is not in either hashmap, free it explicitly
+        if (self.root.watch_data.file_set) |set| {
+            var mset = set;
+            for (mset.items) |file| allocator.free(file);
+            mset.deinit(allocator);
+        }
+        allocator.free(self.root.abs_dirname);
+        self.root.children.deinit(allocator);
+        allocator.destroy(self.root);
     }
 
     pub fn add(
@@ -206,14 +221,18 @@ pub const Paths = struct {
         abs_path: []const u8,
         file_set: ?std.ArrayList([]const u8)
     ) !void {
+        std.log.debug("Paths.add: {s}", .{abs_path});
+
         const file = try std.Io.Dir.openFileAbsolute(io, abs_path,
             .{ .path_only = true, .follow_symlinks = true });
         const stat = try file.stat(io);
 
+        var found: bool = undefined;
+        var node: *PathNode = undefined;
         if (stat.kind == .directory) {
             const find_ret = try self.find(abs_path);
-            const found = find_ret.found;
-            const node = find_ret.node;
+            found = find_ret.found;
+            node = find_ret.node;
 
             if (found) {
                 if (node.active())
@@ -223,14 +242,15 @@ pub const Paths = struct {
             } else {
                 var new_node = try PathNode.init(allocator, try allocator.dupe(u8, abs_path));
                 new_node.parent = node;
+                try node.children.append(allocator, new_node);
                 try self.startWatch(new_node, file_set);
-                try self.hashes.path_node.put(try allocator.dupe(u8, abs_path), node);
+                try self.hashes.path_node.put(try allocator.dupe(u8, abs_path), new_node);
             }
         } else {
             const dirname = std.fs.path.dirname(abs_path) orelse "";
             const find_ret = try self.find(dirname);
-            const found = find_ret.found;
-            const node = find_ret.node;
+            found = find_ret.found;
+            node = find_ret.node;
 
             var single_set = try std.ArrayList([]const u8).initCapacity(allocator, 1);
             try single_set.append(allocator, try allocator.dupe(u8, std.fs.path.basename(abs_path)));
@@ -243,10 +263,13 @@ pub const Paths = struct {
             } else {
                 var new_node = try PathNode.init(allocator, try allocator.dupe(u8, abs_path));
                 new_node.parent = node;
+                try node.children.append(allocator, new_node);
                 try self.startWatch(new_node, single_set);
-                try self.hashes.path_node.put(try allocator.dupe(u8, abs_path), node);
+                try self.hashes.path_node.put(try allocator.dupe(u8, abs_path), new_node);
             }
         }
+
+        std.log.debug("Paths.add: kind={s} found={}", .{@tagName(stat.kind), found});
     }
 
     pub fn remove(self: *Self, allocator: Allocator, io: std.Io, abs_path: []const u8) !void {
@@ -264,16 +287,163 @@ pub const Paths = struct {
             const basename = std.fs.path.basename(abs_path);
 
             if (dirname == null) return;
-            if (self.hashes.path_node.get(dirname.?)) |node| {
-                if (node.watch_data.file_set == null) return;
+            const node = self.hashes.path_node.get(dirname.?) orelse blk: {
+                // dirname may be root, which is not in path_node
+                if (mem.eql(u8, dirname.?, self.root.abs_dirname)) break :blk self.root;
+                return;
+            };
+            if (node.watch_data.file_set == null) return;
 
-                for (node.watch_data.file_set.?.items, 0..) |item, i| {
-                    if (mem.eql(u8, item, basename)) {
-                        _ = node.watch_data.file_set.?.orderedRemove(i);
-                        return;
-                    }
+            for (node.watch_data.file_set.?.items, 0..) |item, i| {
+                if (mem.eql(u8, item, basename)) {
+                    allocator.free(node.watch_data.file_set.?.items[i]);
+                    _ = node.watch_data.file_set.?.orderedRemove(i);
+                    return;
                 }
             }
         }
     }
 };
+
+test "Paths.find - path not under root" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    var paths = try Paths.init(allocator, io, tmp_path);
+    defer paths.deinit(allocator);
+
+    const result = paths.find("/nonexistent/path");
+    try std.testing.expectError(WatchError.PathNotUnderRoot, result);
+}
+
+test "Paths.find - exact root match returns root node" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    var paths = try Paths.init(allocator, io, tmp_path);
+    defer paths.deinit(allocator);
+
+    const result = try paths.find(tmp_path);
+    try std.testing.expect(result.found);
+}
+
+test "Paths.add - directory creates node" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const sub_path = try std.fmt.allocPrint(allocator, "{s}/subdir", .{tmp_path});
+    defer allocator.free(sub_path);
+
+    // Create a real subdirectory inside tmp
+    try std.Io.Dir.createDirAbsolute(io, sub_path, @enumFromInt(0o755));
+
+    var paths = try Paths.init(allocator, io, tmp_path);
+    defer paths.deinit(allocator);
+
+    try paths.add(allocator, io, sub_path, null);
+    const result = try paths.find(sub_path);
+    try std.testing.expect(result.found);
+}
+
+test "Paths.find - descendant not in tree returns closest ancestor" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    var paths = try Paths.init(allocator, io, tmp_path);
+    defer paths.deinit(allocator);
+
+    const deep = try std.fmt.allocPrint(allocator, "{s}/a/b/c", .{tmp_path});
+    defer allocator.free(deep);
+
+    const result = try paths.find(deep);
+    try std.testing.expect(!result.found);
+    try std.testing.expectEqual(paths.root, result.node);
+}
+
+test "Paths.add - file creates node with file_set" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/test.txt", .{tmp_path});
+    defer allocator.free(file_path);
+
+    // Create the file
+    const f = try std.Io.Dir.createFileAbsolute(io, file_path, .{});
+    f.close(io);
+
+    var paths = try Paths.init(allocator, io, tmp_path);
+    defer paths.deinit(allocator);
+
+    try paths.add(allocator, io, file_path, null);
+
+    // The parent directory node should exist and have a file_set containing "test.txt"
+    const result = try paths.find(tmp_path);
+    try std.testing.expect(result.found);
+    try std.testing.expect(result.node.watch_data.file_set != null);
+    try std.testing.expectEqualStrings("test.txt", result.node.watch_data.file_set.?.items[0]);
+}
+
+test "Paths.add - adding same directory twice is idempotent" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const sub_path = try std.fmt.allocPrint(allocator, "{s}/subdir", .{tmp_path});
+    defer allocator.free(sub_path);
+    try std.Io.Dir.createDirAbsolute(io, sub_path, @enumFromInt(0o755));
+
+    var paths = try Paths.init(allocator, io, tmp_path);
+    defer paths.deinit(allocator);
+
+    try paths.add(allocator, io, sub_path, null);
+    try paths.add(allocator, io, sub_path, null);
+
+    // Should still be exactly one child of root
+    try std.testing.expectEqual(@as(usize, 1), paths.root.children.items.len);
+}
+
+test "Paths.remove - file is removed from file_set" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const file_path = try std.fmt.allocPrint(allocator, "{s}/test.txt", .{tmp_path});
+    defer allocator.free(file_path);
+    const f = try std.Io.Dir.createFileAbsolute(io, file_path, .{});
+    f.close(io);
+
+    var paths = try Paths.init(allocator, io, tmp_path);
+    defer paths.deinit(allocator);
+
+    try paths.add(allocator, io, file_path, null);
+    try paths.remove(allocator, io, file_path);
+
+    const result = try paths.find(tmp_path);
+    try std.testing.expectEqual(@as(usize, 0), result.node.watch_data.file_set.?.items.len);
+}
