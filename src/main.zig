@@ -14,6 +14,7 @@ const Command = enum {
     drop,
 };
 
+
 const Request = struct {
     cmd: Command,
     args: []const []const u8,
@@ -127,7 +128,10 @@ pub fn main(init: std.process.Init) !void {
         std.log.debug("Received len={d}: '{s}'", .{json_trimmed.len, json_trimmed});
         if (json_trimmed.len == 0) continue;
 
-        const parsed = try std.json.parseFromSlice(Request, init.gpa, json_trimmed, .{});
+        const parsed = std.json.parseFromSlice(Request, init.gpa, json_trimmed, .{}) catch {
+            try sendError(streamout, "malformed request");
+            continue;
+        };
         defer parsed.deinit();
 
         if (no_repo and parsed.value.cmd != .init) {
@@ -196,11 +200,12 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 };
 
+                no_repo = false;
+
                 try sendSuccess(streamout);
 
                 const thread = try std.Thread.spawn(.{},
                     auto.watchFilesWrapper, .{init, repo.?, pipe_read_fd});
-
                 thread.detach();
             },
             .git => {
@@ -238,7 +243,7 @@ pub fn main(init: std.process.Init) !void {
                 };
 
                 for (added_paths.items) |file| {
-                    const cmd = auto.WatchCmd{ .op = .add, .path = file };
+                    const cmd = auto.WatchCmd.init(.add, file);
                     _ = std.os.linux.write(pipe_write_fd, @ptrCast(&cmd), @sizeOf(auto.WatchCmd));
                 }
 
@@ -261,7 +266,7 @@ pub fn main(init: std.process.Init) !void {
                 };
 
                 for (dropped_paths.items) |file| {
-                    const cmd = auto.WatchCmd{ .op = .remove, .path = file };
+                    const cmd = auto.WatchCmd.init(.remove, file);
                     _ = std.os.linux.write(pipe_write_fd, @ptrCast(&cmd), @sizeOf(auto.WatchCmd));
                 }
 

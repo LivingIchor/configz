@@ -121,14 +121,25 @@ pub const Paths = struct {
         path_node: std.StringHashMap(*PathNode),
     },
 
-    pub fn startWatch(self: *Self, node: *PathNode, file_set: ?std.ArrayList([]const u8)) !void {
+    pub fn startWatch(
+        self: *Self,
+        allocator: Allocator,
+        node: *PathNode,
+        file_set: ?std.ArrayList([]const u8)
+    ) !void {
         if (node.watch_data.wd != 0) return;
         node.watch_data.file_set = file_set;
 
-        const wd: i32 = @intCast(std.os.linux.inotify_add_watch(self.ifd, @ptrCast(node.abs_dirname),
-            std.os.linux.IN.MODIFY | std.os.linux.IN.CREATE |
+        const path_z = try allocator.dupeZ(u8, node.abs_dirname);
+        defer allocator.free(path_z);
+
+        const wd_raw: i32 = @intCast(std.os.linux.inotify_add_watch(self.ifd, path_z,
+            std.os.linux.IN.CREATE | std.os.linux.IN.CLOSE_WRITE |
             std.os.linux.IN.DELETE | std.os.linux.IN.MOVED_FROM |
             std.os.linux.IN.MOVED_TO));
+
+        if (wd_raw == std.math.maxInt(usize)) return error.InotifyError;
+        const wd: i32 = @intCast(wd_raw);
         try self.hashes.wd_node.put(wd, node);
     }
 
@@ -238,12 +249,12 @@ pub const Paths = struct {
                 if (node.active())
                     try node.meshData(allocator, if (file_set) |set| set else null)
                 else
-                    try self.startWatch(node, file_set);
+                    try self.startWatch(allocator, node, file_set);
             } else {
                 var new_node = try PathNode.init(allocator, try allocator.dupe(u8, abs_path));
                 new_node.parent = node;
                 try node.children.append(allocator, new_node);
-                try self.startWatch(new_node, file_set);
+                try self.startWatch(allocator, new_node, file_set);
                 try self.hashes.path_node.put(try allocator.dupe(u8, abs_path), new_node);
             }
         } else {
@@ -259,13 +270,13 @@ pub const Paths = struct {
                 if (node.active())
                     try node.meshData(allocator, single_set)
                 else
-                    try self.startWatch(node, single_set);
+                    try self.startWatch(allocator, node, single_set);
             } else {
-                var new_node = try PathNode.init(allocator, try allocator.dupe(u8, abs_path));
+                var new_node = try PathNode.init(allocator, try allocator.dupe(u8, dirname));
                 new_node.parent = node;
                 try node.children.append(allocator, new_node);
-                try self.startWatch(new_node, single_set);
-                try self.hashes.path_node.put(try allocator.dupe(u8, abs_path), new_node);
+                try self.startWatch(allocator, new_node, single_set);
+                try self.hashes.path_node.put(try allocator.dupe(u8, dirname), new_node);
             }
         }
 
@@ -302,6 +313,23 @@ pub const Paths = struct {
                 }
             }
         }
+    }
+
+    pub fn writeWatchedDirs(self: *Self, io: std.Io, path: []const u8) !void {
+        const file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+        var buf: [4096]u8 = undefined;
+        var writer = file.writer(io, &buf);
+        var w = &writer.interface;
+
+        var it = self.hashes.path_node.iterator();
+        while (it.next()) |entry| {
+            const maybe_dir = std.Io.Dir.openDirAbsolute(io, entry.key_ptr.*, .{});
+            if (maybe_dir) |dir| {
+                dir.close(io);
+                try w.print("{s}\n", .{entry.key_ptr.*});
+            } else |_| {}
+        }
+        try w.flush();
     }
 };
 

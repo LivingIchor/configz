@@ -172,6 +172,25 @@ pub fn handleSync(
         err_msg.* = try init.gpa.dupe(u8, "failed to create commit");
         return error.GitError;
     }
+
+    // Push to origin
+    var remote_obj: ?*c.git_remote = null;
+    if (c.git_remote_lookup(&remote_obj, repo, "origin") != 0) {
+        err_msg.* = try init.gpa.dupe(u8, "failed to lookup remote");
+        return error.GitError;
+    }
+    defer c.git_remote_free(remote_obj);
+
+    const refspecs = [_][*:0]const u8{"refs/heads/master:refs/heads/master"};
+    const refspec_array = c.git_strarray{
+        .strings = @constCast(@ptrCast(&refspecs)),
+        .count = 1,
+    };
+
+    if (c.git_remote_push(remote_obj, &refspec_array, null) != 0) {
+        err_msg.* = try init.gpa.dupe(u8, "failed to push to remote");
+        return error.GitError;
+    }
 }
 
 pub fn handleInit(
@@ -315,6 +334,8 @@ fn addPath(
         defer dir.close(init.io);
         var it = dir.iterate();
         while (try it.next(init.io)) |entry| {
+            if (entry.kind == .directory and std.mem.eql(u8, entry.name, ".git")) continue;
+
             const child_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{ rel_path, entry.name });
             defer init.gpa.free(child_path);
             try addPath(init, repo, index, home, child_path, buf, pos);
@@ -377,7 +398,7 @@ pub fn handleDrop(
     var buf: [4096]u8 = undefined;
     var pos: usize = 0;
     for (args) |file| {
-        dropPath(init, repo.?, index.?, home, file, &buf, &pos) catch continue;
+        dropPath(init, index.?, home, file, &buf, &pos) catch continue;
         try dropped_paths.append(init.gpa, try init.gpa.dupe(u8, file));
     }
     if (pos > 0) {
@@ -393,7 +414,6 @@ pub fn handleDrop(
 
 fn dropPath(
     init: std.process.Init,
-    repo: *c.git_repository,
     index: *c.git_index,
     home: [*:0]const u8,
     rel_path: []const u8,
@@ -403,49 +423,25 @@ fn dropPath(
     const full_path = try std.fmt.allocPrintSentinel(init.gpa, "{s}/{s}", .{ home, rel_path }, 0);
     defer init.gpa.free(full_path);
 
-    const maybe_dir = std.Io.Dir.openDirAbsolute(init.io, full_path, .{.iterate = true});
+    const maybe_dir = std.Io.Dir.openDirAbsolute(init.io, full_path, .{ .iterate = true });
     if (maybe_dir) |dir| {
         defer dir.close(init.io);
         var it = dir.iterate();
         while (try it.next(init.io)) |entry| {
+            if (entry.kind == .directory and std.mem.eql(u8, entry.name, ".git")) continue;
             const child_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{ rel_path, entry.name });
             defer init.gpa.free(child_path);
-            try dropPath(init, repo, index, home, child_path, buf, pos);
+            try dropPath(init, index, home, child_path, buf, pos);
         }
     } else |_| {
         const file_z = try init.gpa.dupeSentinel(u8, rel_path, 0);
         defer init.gpa.free(file_z);
 
-        var oid: c.git_oid = undefined;
-        if (c.git_blob_create_from_disk(&oid, repo, full_path) != 0) {
-            pos.* += (try std.fmt.bufPrint(buf[pos.*..], "\n ~> {s}: failed to create blob", .{rel_path})).len;
-            return error.GitError;
-        }
-
-        var statx_buf: std.os.linux.Statx = undefined;
-        _ = std.os.linux.statx(
-            std.os.linux.AT.FDCWD,
-            full_path,
-            0,
-            .BASIC_STATS,
-            &statx_buf,
-        );
-
-        var entry: c.git_index_entry = std.mem.zeroes(c.git_index_entry);
-        entry.path = file_z;
-        entry.mode = 0o100644;
-        entry.id = oid;
-        entry.mode = statx_buf.mode;
-        entry.file_size = @intCast(statx_buf.size);
-        entry.mtime.seconds = @intCast(statx_buf.mtime.sec);
-        entry.mtime.nanoseconds = @intCast(statx_buf.mtime.nsec);
-        entry.ctime.seconds = @intCast(statx_buf.ctime.sec);
-        entry.ctime.nanoseconds = @intCast(statx_buf.ctime.nsec);
-
-        if (c.git_index_remove(index, file_z, 0) != 0) {
-            pos.* += (try std.fmt.bufPrint(buf[pos.*..], "\n ~> {s}: failed to remove", .{rel_path})).len;
-            return error.GitError;
-        }
+        std.log.debug("dropPath: removing '{s}' from index, result={d}",
+            .{rel_path, c.git_index_remove(index, file_z, 0)});
+        // if (c.git_index_remove(index, file_z, 0) != 0) {
+        //     pos.* += (try std.fmt.bufPrint(buf[pos.*..], "\n ~> {s}: failed to remove", .{rel_path})).len;
+        //     return error.GitError;
+        // }
     }
 }
-

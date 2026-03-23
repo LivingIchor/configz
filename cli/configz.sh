@@ -179,7 +179,7 @@ function cmd_purge {
 
 # Initializes a new bare repo at the default location and sets the given remote
 function cmd_init {
-    [[ $# -gt 0 ]] || die "usage: configz init <remote>"
+    [[ $# -gt 0 ]] || die "Usage: configz init <remote>"
 
     local payload response ok
     payload=$(jq -cn \
@@ -200,6 +200,8 @@ function cmd_init {
 
 # Passes arguments directly to git, allowing full access to git's command set
 function cmd_git {
+    [[ $# -gt 0 ]] || die "Usage: configz git -- <args>"
+
     local payload response ok
     payload=$(jq -cn \
         --args '{"cmd": "git", "args": $ARGS.positional}' \
@@ -218,7 +220,7 @@ function cmd_git {
 
 # Begins tracking one or more files by adding them to the bare repo
 function cmd_add {
-    [[ $# -gt 0 ]] || die "usage: configz add <file> [file...]"
+    [[ $# -gt 0 ]] || die "Usage: configz add <file> [file...]"
 
     local resolved=()
     for f in "$@"; do
@@ -245,7 +247,7 @@ function cmd_add {
 
 # Stops tracking one or more files by removing them from the bare repo
 function cmd_drop {
-    [[ $# -gt 0 ]] || die "usage: configz drop <file> [file...]"
+    [[ $# -gt 0 ]] || die "Usage: configz drop <file> [file...]"
 
     local resolved=()
     for f in "$@"; do
