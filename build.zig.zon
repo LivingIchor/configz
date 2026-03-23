@@ -8,7 +8,7 @@
     .dependencies = .{
         .clap = .{
             .url = "https://github.com/Hejsil/zig-clap/archive/refs/heads/master.tar.gz",
-            .hash = "clap-0.11.0-oBajBxToAQBCuP2IJxUwO2-coRk96cBGDrJezaNZjsQN",
+            .hash = "clap-0.11.0-oBajB7foAQC3Iyn4IVCkUdYaOVVng5IZkSncySTjNig1",
         },
     },
     .paths = .{
