@@ -129,13 +129,13 @@ pub fn main(init: std.process.Init) !void {
         if (json_trimmed.len == 0) continue;
 
         const parsed = std.json.parseFromSlice(Request, init.gpa, json_trimmed, .{}) catch {
-            try sendError(streamout, "malformed request");
+            sendError(streamout, "malformed request");
             continue;
         };
         defer parsed.deinit();
 
         if (no_repo and parsed.value.cmd != .init) {
-            try sendError(streamout, "repo not initialized, run 'configz init <remote>' first");
+            sendError(streamout, "repo not initialized, run 'configz init <remote>' first");
             continue;
         }
 
@@ -143,26 +143,23 @@ pub fn main(init: std.process.Init) !void {
         switch (parsed.value.cmd) {
             .status => {
                 if (parsed.value.args.len > 0) {
-                    try sendError(streamout, "status doesn't take arguments");
+                    sendError(streamout, "status doesn't take arguments");
                     continue;
                 }
 
                 cmds.handleStatus(init, repo, &err_msg) catch {
-                    try sendError(streamout, err_msg);
+                    sendError(streamout, err_msg);
                     continue;
                 };
 
-                var stringify = std.json.Stringify{.writer = streamout};
-                try stringify.write(.{ .ok = true, .output = err_msg });
-                try streamout.writeByte('\n');
-                try streamout.flush();
+                writeResponse(streamout, .{ .ok = true, .output = err_msg });
             },
             .sync => {
                 if (parsed.value.args.len < 1) {
-                    try sendError(streamout, "sync doesn't requires a subject");
+                    sendError(streamout, "sync doesn't requires a subject");
                     continue;
                 } else if (parsed.value.args.len > 2) {
-                    try sendError(streamout, "sync can only take a subject and body text");
+                    sendError(streamout, "sync can only take a subject and body text");
                     continue;
                 }
 
@@ -174,20 +171,20 @@ pub fn main(init: std.process.Init) !void {
                 defer if (body) |b| init.gpa.free(b);
 
                 cmds.handleSync(init, repo, subject, body, &err_msg) catch {
-                    try sendError(streamout, err_msg);
+                    sendError(streamout, err_msg);
                     continue;
                 };
 
-                try sendSuccess(streamout);
+                sendSuccess(streamout);
             },
             .init => {
                 if (!no_repo) {
-                    try sendError(streamout, "repo already initialized");
+                    sendError(streamout, "repo already initialized");
                     continue;
                 }
 
                 if (parsed.value.args.len != 1) {
-                    try sendError(streamout, "init requires one remote URL");
+                    sendError(streamout, "init requires one remote URL");
                     continue;
                 }
 
@@ -196,13 +193,13 @@ pub fn main(init: std.process.Init) !void {
 
                 cmds.handleInit(init, &repo, remote, &err_msg) catch {
                     const msg: []const u8 = err_msg;
-                    try sendError(streamout, msg);
+                    sendError(streamout, msg);
                     continue;
                 };
 
                 no_repo = false;
 
-                try sendSuccess(streamout);
+                sendSuccess(streamout);
 
                 const thread = try std.Thread.spawn(.{},
                     auto.watchFilesWrapper, .{init, repo.?, pipe_read_fd});
@@ -210,7 +207,7 @@ pub fn main(init: std.process.Init) !void {
             },
             .git => {
                 if (parsed.value.args.len < 1) {
-                    try sendError(streamout, "git requires at least one argument");
+                    sendError(streamout, "git requires at least one argument");
                     continue;
                 }
 
@@ -218,17 +215,14 @@ pub fn main(init: std.process.Init) !void {
                 var err: []const u8 = "";
                 try cmds.handleGit(init, parsed.value.args, &out, &err);
 
-                var stringify = std.json.Stringify{.writer = streamout};
-                try stringify.write(.{ .ok = true, .output = .{
+                writeResponse(streamout, .{ .ok = true, .output = .{
                     .out = @as([]const u8, out),
                     .err = @as([]const u8, err),
                 }});
-                try streamout.writeByte('\n');
-                try streamout.flush();
             },
             .add => {
                 if (parsed.value.args.len < 1) {
-                    try sendError(streamout, "add requires at least one file");
+                    sendError(streamout, "add requires at least one file");
                     continue;
                 }
 
@@ -238,7 +232,7 @@ pub fn main(init: std.process.Init) !void {
 
                 cmds.handleAdd(init, repo, parsed.value.args, &err_msg, &added_paths) catch {
                     const msg: []const u8 = err_msg;
-                    try sendError(streamout, msg);
+                    sendError(streamout, msg);
                     continue;
                 };
 
@@ -247,11 +241,11 @@ pub fn main(init: std.process.Init) !void {
                     _ = std.os.linux.write(pipe_write_fd, @ptrCast(&cmd), @sizeOf(auto.WatchCmd));
                 }
 
-                try sendSuccess(streamout);
+                sendSuccess(streamout);
             },
             .drop => {
                 if (parsed.value.args.len < 1) {
-                    try sendError(streamout, "drop requires at least one file");
+                    sendError(streamout, "drop requires at least one file");
                     continue;
                 }
 
@@ -261,7 +255,7 @@ pub fn main(init: std.process.Init) !void {
 
                 cmds.handleDrop(init, repo, parsed.value.args, &err_msg, &dropped_paths) catch {
                     const msg: []const u8 = err_msg;
-                    try sendError(streamout, msg);
+                    sendError(streamout, msg);
                     continue;
                 };
 
@@ -270,24 +264,34 @@ pub fn main(init: std.process.Init) !void {
                     _ = std.os.linux.write(pipe_write_fd, @ptrCast(&cmd), @sizeOf(auto.WatchCmd));
                 }
 
-                try sendSuccess(streamout);
+                sendSuccess(streamout);
             },
         }
     }
 }
 
-fn sendSuccess(writer: *std.Io.Writer) !void {
+// Write a JSON response and flush. Broken-pipe errors (client disconnected
+// before we could reply) are logged and swallowed — a dead client must never
+// crash the daemon.
+fn writeResponse(writer: *std.Io.Writer, value: anytype) void {
+    writeResponseInner(writer, value) catch |err| {
+        std.log.debug("client write failed (client likely disconnected): {}", .{err});
+    };
+}
+
+fn writeResponseInner(writer: *std.Io.Writer, value: anytype) !void {
     var stringify = std.json.Stringify{.writer = writer};
-    try stringify.write(.{ .ok = true, .output = "" });
+    try stringify.write(value);
     try writer.writeByte('\n');
     try writer.flush();
 }
 
-fn sendError(writer: *std.Io.Writer, msg: []const u8) !void {
-    var stringify = std.json.Stringify{.writer = writer};
-    try stringify.write(.{ .ok = false, .output = msg });
-    try writer.writeByte('\n');
-    try writer.flush();
+fn sendSuccess(writer: *std.Io.Writer) void {
+    writeResponse(writer, .{ .ok = true, .output = "" });
+}
+
+fn sendError(writer: *std.Io.Writer, msg: []const u8) void {
+    writeResponse(writer, .{ .ok = false, .output = msg });
 }
 
 fn daemonize(init: std.process.Init) !void {
