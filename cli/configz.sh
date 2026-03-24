@@ -15,7 +15,8 @@ set -euo pipefail
 
 # ── Global vars ───────────────────────────────────────────────────────────────
 
-WATCH_FILE="$HOME/.local/share/configz/watched_dirs"
+REPO_DIR="$HOME/.local/share/configz"
+WATCH_FILE="$REPO_DIR/watched_dirs"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -200,22 +201,7 @@ function cmd_init {
 
 # Passes arguments directly to git, allowing full access to git's command set
 function cmd_git {
-    [[ $# -gt 0 ]] || die "Usage: configz git -- <args>"
-
-    local payload response ok
-    payload=$(jq -cn \
-        --args '{"cmd": "git", "args": $ARGS.positional}' \
-        -- "$@")
-
-    response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
-    ok=$(echo "$response" | jq -r '.ok')
-
-    if [[ "$ok" == "true" ]]; then
-        printf '%s' "$(echo "$response" | jq -r '.output.out')"
-        printf '%s' "$(echo "$response" | jq -r '.output.err')" 1>&2
-    else
-        die "Malformed response from configzd"
-    fi
+    git --git-dir="$REPO_DIR" --work-tree="$HOME" "$@"
 }
 
 # Begins tracking one or more files by adding them to the bare repo
@@ -292,7 +278,7 @@ function show_help {
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
-require socat jq
+require git socat jq
 
 [[ -n "$XDG_RUNTIME_DIR" ]] || die "XDG_RUNTIME_DIR is not set"
 SOCK="$XDG_RUNTIME_DIR/configz.sock"

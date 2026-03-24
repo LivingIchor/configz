@@ -230,55 +230,6 @@ pub fn handleInit(
     _ = c.git_config_set_string(cfg, "status.showUntrackedFiles", "no");
 }
 
-pub fn handleGit(
-    init: std.process.Init,
-    args: []const []const u8,
-    out: *[]const u8,
-    err: *[]const u8
-) !void {
-    const home = try init.minimal.environ.getAlloc(init.gpa, "HOME");
-    const repo_path = try std.fmt.allocPrint(init.gpa, config.bare_repo_path_fmt, .{home});
-    defer init.gpa.free(repo_path);
-
-    var argv = try std.ArrayList([]const u8).initCapacity(init.gpa, args.len + 1);
-    defer argv.deinit(init.gpa);
-    try argv.append(init.gpa, "git");
-    try argv.appendSlice(init.gpa, args);
-
-    var spawn_opts = std.process.SpawnOptions{.argv = argv.items};
-    spawn_opts.stdout = .pipe;
-    spawn_opts.stderr = .pipe;
-
-    var env = std.process.Environ.Map.init(init.gpa);
-    defer env.deinit();
-    try env.put("GIT_DIR", repo_path);
-    try env.put("GIT_WORK_TREE", home);
-    try env.put("GIT_CONFIG_COUNT", "1");
-    try env.put("GIT_CONFIG_KEY_0", "color.ui");
-    try env.put("GIT_CONFIG_VALUE_0", "always");
-    spawn_opts.environ_map = &env;
-
-    var child = try std.process.spawn(init.io, spawn_opts);
-
-    var outbuf: [1024 * 1024]u8 = undefined;
-    var outreader = child.stdout.?.reader(init.io, &outbuf);
-    var stdout = &outreader.interface;
-
-    var errbuf: [64 * 1024]u8 = undefined;
-    var errreader = child.stderr.?.reader(init.io, &errbuf);
-    var stderr = &errreader.interface;
-
-    while (stdout.fillMore() catch null) |_| {}
-    while (stderr.fillMore() catch null) |_| {}
-
-    const term = try child.wait(init.io);
-    if (term.exited != 0) {
-        err.* = try init.gpa.dupe(u8, stderr.buffered());
-    }
-
-    out.* = try init.gpa.dupe(u8, stdout.buffered());
-}
-
 pub fn handleAdd(
     init: std.process.Init,
     repo: ?*c.git_repository,

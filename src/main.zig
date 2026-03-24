@@ -9,7 +9,6 @@ const Command = enum {
     status,
     sync,
     init,
-    git,
     add,
     drop,
 };
@@ -204,21 +203,6 @@ pub fn main(init: std.process.Init) !void {
                 const thread = try std.Thread.spawn(.{},
                     auto.watchFilesWrapper, .{init, repo.?, pipe_read_fd});
                 thread.detach();
-            },
-            .git => {
-                if (parsed.value.args.len < 1) {
-                    sendError(streamout, "git requires at least one argument");
-                    continue;
-                }
-
-                var out: []const u8 = "";
-                var err: []const u8 = "";
-                try cmds.handleGit(init, parsed.value.args, &out, &err);
-
-                writeResponse(streamout, .{ .ok = true, .output = .{
-                    .out = @as([]const u8, out),
-                    .err = @as([]const u8, err),
-                }});
             },
             .add => {
                 if (parsed.value.args.len < 1) {
