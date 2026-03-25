@@ -300,7 +300,7 @@ assert_contains "drop requires arguments" "Usage: configz drop" "$output"
 output=$(cz add "/etc/passwd" 2>&1 || true)
 assert_contains "add outside home fails" "home directory" "$output"
 
-output=$(cz git -- 2>&1 || true)
+output=$(cz git 2>&1 || true)
 assert_contains "git requires -- separator" "Usage: configz git" "$output"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
