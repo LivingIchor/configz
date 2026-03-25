@@ -8,6 +8,7 @@
 #     configz purge                   — Permanently delete the local repo and all data"
 #     configz init <remote>           — Initialize bare repo and set remote
 #     configz git -- <args>           — Pass commands directly to git
+#     configz install <remote>        —
 #     configz add <file> [file...]    — Begin tracking a file
 #     configz drop <file> [file...]   — Stop tracking a file
 
@@ -204,6 +205,21 @@ function cmd_git {
     git --git-dir="$REPO_DIR" --work-tree="$HOME" "$@"
 }
 
+function cmd_install {
+    local remote="$1"
+    if [[ -z "$remote" ]]; then
+        echo "Usage: configz install <remote>" >&2
+        return 1
+    fi
+    if [[ -d "$REPO_DIR" ]]; then
+        echo "Repo already exists at $REPO_DIR" >&2
+        return 1
+    fi
+    if git clone --bare "$remote" "$REPO_DIR"; then
+        cmd_git checkout
+    fi
+}
+
 # Begins tracking one or more files by adding them to the bare repo
 function cmd_add {
     [[ $# -gt 0 ]] || die "Usage: configz add <file> [file...]"
@@ -271,6 +287,7 @@ function show_help {
     echo "    configz purge                  — Permanently delete the local repo and all data"
     echo "    configz init <remote>          — Initialize bare repo and set remote"
     echo "    configz git -- <args>          — Pass commands directly to git"
+    echo "    configz install <remote>       — "
     echo "    configz add <file> [file...]   — Begin tracking a file"
     echo "    configz drop <file> [file...]  — Stop tracking a file"
 }
@@ -280,8 +297,14 @@ function show_help {
 
 require git socat jq
 
-[[ -n "$XDG_RUNTIME_DIR" ]] || die "XDG_RUNTIME_DIR is not set"
-SOCK="$XDG_RUNTIME_DIR/configz.sock"
+case "${1:-}" in
+    ""|status|sync|purge|init|add|drop)
+        [[ -n "$XDG_RUNTIME_DIR" ]] || die "XDG_RUNTIME_DIR is not set"
+        SOCK="$XDG_RUNTIME_DIR/configz.sock"
+        ;;
+    *)
+        ;;
+esac
 
 case "${1:-}" in
     ""|status)
@@ -303,6 +326,9 @@ case "${1:-}" in
         fi
         shift
         cmd_git "$@"
+        ;;
+    install)
+        shift; cmd_install "$@"
         ;;
     add)
         shift; cmd_add "$@"
