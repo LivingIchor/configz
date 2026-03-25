@@ -202,11 +202,6 @@ function cmd_init {
 
 # Passes arguments directly to git, allowing full access to git's command set
 function cmd_git {
-    if [[ "$1" != "--" ]]; then
-        die "expected '--' before git arguments"$'\n'"Usage: configz git -- <args>"
-    fi
-    shift
-
     git --git-dir="$REPO_DIR" --work-tree="$HOME" "$@"
 }
 
@@ -329,6 +324,10 @@ case "${1:-}" in
         if [[ $# -eq 0 ]]; then
             die "Usage: configz git -- <args>"
         fi
+        if [[ "$1" != "--" ]]; then
+            die "expected '--' before git arguments"$'\n'"Usage: configz git -- <args>"
+        fi
+        shift
         cmd_git "$@"
         ;;
     install)
