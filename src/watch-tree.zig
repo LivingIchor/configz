@@ -1,12 +1,16 @@
 const std = @import("std");
-const c = @import("c.zig").git2;
 const mem = std.mem;
 const Allocator = mem.Allocator;
+
+const c = @import("c.zig").git2;
 
 pub const WatchError = error {
     PathNotUnderRoot,
 };
 
+// A node in the watch tree. Each node represents a watched directory, tracking
+// its inotify watch descriptor and — for file-granular watches — the specific
+// filenames of interest within that directory
 const PathNode = struct {
     const Self = @This();
 
@@ -14,14 +18,23 @@ const PathNode = struct {
     parent: ?*PathNode,
     children: std.ArrayList(*PathNode),
     watch_data: struct {
+        // 0 means there's no watch
         wd: i32,
+        // null means watch the whole directory. Non-null filters events to
+        // specific filenames, used when a file rather than a directory was added
         file_set: ?std.ArrayList([]const u8),
     },
 
+
+    // ── Helpers ──────────────────────────────────────────────────────────────────────────────────
+
+    // Whether this node has an active inotify watch
     pub fn active(self: Self) bool {
         return self.watch_data.wd != 0;
     }
 
+    // The path segment from this node's parent to itself. Used to reconstruct
+    // relative paths without re-allocating the full absolute path
     pub fn path_shard(self: Self) []const u8 {
         if (self.parent) |parent| {
             const parent_len = parent.abs_dirname.len;
@@ -31,6 +44,8 @@ const PathNode = struct {
         }
     }
 
+    // Append any new_children not already present in self.children
+    // Pointer equality is used — the same node won't be adopted twice
     pub fn adopt(self: *Self, allocator: Allocator, new_children: std.ArrayList(*PathNode)) !void {
         var found = false;
         for (new_children.items) |new| {
@@ -46,6 +61,9 @@ const PathNode = struct {
         }
     }
 
+    // Merge additions into this node's file_set, deduplicating by filename
+    // If file_set is null (whole-directory watch), additions are freed and ignored
+    // If additions is null, the file_set is cleared entirely
     pub fn meshData(
         self: Self,
         allocator: Allocator,
@@ -82,6 +100,9 @@ const PathNode = struct {
         }
     }
 
+
+    // ── Existentials ─────────────────────────────────────────────────────────────────────────────
+
     pub fn init(allocator: Allocator, abs_path: []const u8) error{OutOfMemory}!*Self {
         const node = try allocator.create(PathNode);
 
@@ -111,6 +132,9 @@ const PathNode = struct {
     }
 };
 
+// The inotify-backed watch tree. Tracks a hierarchy of PathNodes rooted at a
+// single directory. Two hashmaps provide O(1) lookup by inotify watch descriptor
+// (for event dispatch) and by absolute path (for add/remove operations)
 pub const Paths = struct {
     const Self = @This();
 
@@ -121,6 +145,11 @@ pub const Paths = struct {
         path_node: std.StringHashMap(*PathNode),
     },
 
+
+    // ── Helpers ──────────────────────────────────────────────────────────────────────────────────
+
+    // Register an inotify watch on node and store the wd in both the node and
+    // the wd_node map. No-op if the node is already being watched
     pub fn startWatch(
         self: *Self,
         allocator: Allocator,
@@ -143,6 +172,9 @@ pub const Paths = struct {
         try self.hashes.wd_node.put(wd, node);
     }
 
+    // Walk the tree to find the node for dirname. Returns the node and whether
+    // it was an exact match. On a miss, returns the deepest ancestor found —
+    // the natural insertion point for a new node
     fn find(
         self: *Self,
         dirname: []const u8
@@ -166,6 +198,7 @@ pub const Paths = struct {
 
             if (mem.eql(u8, child.abs_dirname, dirname))
                 return .{ .found = true, .node = child };
+            // Descend if this child is a prefix of the target path
             if (child.abs_dirname.len <= dirname.len and
                 mem.eql(u8, child.abs_dirname, dirname[0..child.abs_dirname.len])) {
                 children = child.children.items;
@@ -178,6 +211,9 @@ pub const Paths = struct {
 
         return .{ .found = false, .node = child.parent orelse root };
     }
+
+
+    // ── Existentials ─────────────────────────────────────────────────────────────────────────────
 
     pub fn init(allocator: Allocator, io: std.Io, dirname: []const u8) !Self {
         const file = try std.Io.Dir.openFileAbsolute(io, dirname,
@@ -225,6 +261,13 @@ pub const Paths = struct {
         allocator.destroy(self.root);
     }
 
+
+    // ── Paths Main ───────────────────────────────────────────────────────────────────────────────
+
+    // Register abs_path for inotify watching. Directories get a whole-directory
+    // watch; files get their parent directory watched with a file_set filter so
+    // events from unrelated siblings are ignored. If the node already exists,
+    // its watch is updated rather than duplicated
     pub fn add(
         self: *Self,
         allocator: Allocator,
@@ -258,6 +301,7 @@ pub const Paths = struct {
                 try self.hashes.path_node.put(try allocator.dupe(u8, abs_path), new_node);
             }
         } else {
+            // For files, watch the parent directory and track the basename in a file_set
             const dirname = std.fs.path.dirname(abs_path) orelse "";
             const find_ret = try self.find(dirname);
             found = find_ret.found;
@@ -283,6 +327,9 @@ pub const Paths = struct {
         std.log.debug("Paths.add: kind={s} found={}", .{@tagName(stat.kind), found});
     }
 
+    // Unregister abs_path from the watch tree. For directories, the node is
+    // removed and its children are reparented to preserve the rest of the tree
+    // For files, only the basename is removed from the parent node's file_set
     pub fn remove(self: *Self, allocator: Allocator, io: std.Io, abs_path: []const u8) !void {
         const file = try std.Io.Dir.openFileAbsolute(io, abs_path,
             .{ .path_only = true, .follow_symlinks = true });
@@ -315,6 +362,9 @@ pub const Paths = struct {
         }
     }
 
+    // Persist explicitly watched directories (those with no file_set filter) to a
+    // file, one per line. Skips parent directories created implicitly for file-granular
+    // watches, and any paths that no longer exist on disk
     pub fn writeWatchedDirs(self: *Self, io: std.Io, path: []const u8) !void {
         const file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
         var buf: [4096]u8 = undefined;
@@ -323,6 +373,8 @@ pub const Paths = struct {
 
         var it = self.hashes.path_node.iterator();
         while (it.next()) |entry| {
+            const node = entry.value_ptr.*;
+            if (node.watch_data.file_set != null) continue; // file-granular watch, skip
             const maybe_dir = std.Io.Dir.openDirAbsolute(io, entry.key_ptr.*, .{});
             if (maybe_dir) |dir| {
                 dir.close(io);
@@ -332,6 +384,11 @@ pub const Paths = struct {
         try w.flush();
     }
 };
+
+
+// ── Testing ──────────────────────────────────────────────────────────────────────────────────────
+// It was a real struggle to get this working properly — hence the EXTENSIVE testing
+// I'm not too experienced and it was the only way I could get it working
 
 test "Paths.find - path not under root" {
     const allocator = std.testing.allocator;

@@ -1,0 +1,16 @@
+TODO:
+⇒ Clean up code and add comments
+ ✓ ./PKGBUILD
+ ✓ cli/configz.sh
+ ✓ src/main.zig
+ ✓ src/commands.zig
+ ✓ src/watch-tree.zig
+ ✓ src/auto.zig
+⇒ fix status
+• fix sync credintials
+• fix socket error message
+• Remove socket from purge and don't exit server (changed my mind)
+• Add common config definition
+• Expand logging and testing and error handling
+ ↳ clean up ./test_configz.sh
+• Prompt for overwrite per file or `--force'

@@ -1,28 +1,53 @@
 const std = @import("std");
+const mem = std.mem;
+
 const c = @import("c.zig").git2;
 const config = @import("config.zig");
 
-pub fn handleStatus(init: std.process.Init, repo: ?*c.git_repository, msg: *[]const u8) !void {
-    var status_list: ?*c.git_status_list = null;
-    var opts: c.git_status_options = undefined;
-    _ = c.git_status_options_init(&opts, c.GIT_STATUS_OPTIONS_VERSION);
-    opts.show = c.GIT_STATUS_SHOW_INDEX_AND_WORKDIR;
+extern fn strerror(errnum: c_int) [*:0]const u8;
 
-    if (c.git_status_list_new(&status_list, repo, &opts) != 0) {
+
+// ── Cmd Handlers ─────────────────────────────────────────────────────────────────────────────────
+
+// Pretty print the status of the git repo
+pub fn handleStatus(init: std.process.Init, repo: ?*c.git_repository, msg: *[]const u8) !void {
+    std.debug.assert(repo != null);
+
+    var opts: c.git_status_options = undefined;
+    const init_rc = c.git_status_options_init(&opts, c.GIT_STATUS_OPTIONS_VERSION);
+    std.debug.assert(init_rc == 0);
+    opts.show = c.GIT_STATUS_SHOW_INDEX_ONLY; // WT and Index should never deviate
+
+    // Create list of index statuses
+    var status_list: ?*c.git_status_list = null;
+    const rc = c.git_status_list_new(&status_list, repo, &opts);
+    if (rc != 0) {
+        // Check if it's just an unborn branch (no commits yet)
+        const err = c.git_error_last();
+        if (err != null and err.*.klass == c.GIT_ERROR_REFERENCE) {
+            // Repo is empty / HEAD is unborn — status is trivially clean or all staged
+            return;
+        }
+        const detail = if (err != null)
+            std.mem.sliceTo(err.*.message, 0)
+        else
+            "unknown libgit2 error";
+        std.debug.print("git_status_list_new: {s}\n", .{detail});
         msg.* = try init.gpa.dupe(u8, "failed to get status");
+
         return error.GitError;
     }
     defer c.git_status_list_free(status_list);
 
+    // Check the number of index changes
     const count = c.git_status_list_entrycount(status_list);
-
-    if (count == 0) {
-        msg.* = try init.gpa.dupe(u8, "nothing to commit, working tree clean");
+    if (count == 0) { // No changes made to tracked files
+        msg.* = try init.gpa.dupe(u8, "Nothing to sync");
         return;
     }
 
+    msg.* = try init.gpa.dupe(u8, "Since last sync:\n");
     var i: usize = 0;
-    var result: ?[]const u8 = null;
     while (i < count) : (i += 1) {
         const entry = c.git_status_byindex(status_list, i);
         const status = entry.*.status;
@@ -31,125 +56,112 @@ pub fn handleStatus(init: std.process.Init, repo: ?*c.git_repository, msg: *[]co
         else
             entry.*.head_to_index.*.old_file.path;
 
-        var new_result: []const u8 = undefined;
-        if ((status & c.GIT_STATUS_INDEX_NEW) != 0) {
-            if (result) |res| {
-                new_result = try std.fmt.allocPrint(
-                    init.gpa, "{s}A  {s}\n",
-                    .{ res, path });
-                init.gpa.free(res);
-            } else {
-                new_result = try std.fmt.allocPrint(
-                    init.gpa, "A  {s}\n",
-                    .{ path });
-            }
-            result = new_result;
-        }
+        // INDEX_(NEW|MODIFIED|DELETED) are all mutually exclusive
+        var action: []const u8 = undefined;
         if ((status & c.GIT_STATUS_INDEX_MODIFIED) != 0) {
-            if (result) |res| {
-                new_result = try std.fmt.allocPrint(
-                    init.gpa, "{s}M  {s}\n",
-                    .{ res, path });
-                init.gpa.free(res);
-            } else {
-                new_result = try std.fmt.allocPrint(
-                    init.gpa, "M  {s}\n",
-                    .{ path });
-            }
-            result = new_result;
-        }
-        if ((status & c.GIT_STATUS_INDEX_DELETED) != 0) {
-            if (result) |res| {
-                new_result = try std.fmt.allocPrint(
-                    init.gpa, "{s}D  {s}\n",
-                    .{ res, path });
-                init.gpa.free(res);
-            } else {
-                new_result = try std.fmt.allocPrint(
-                    init.gpa, "D  {s}\n",
-                    .{ path });
-            }
-            result = new_result;
-        }
-        if ((status & c.GIT_STATUS_WT_MODIFIED) != 0) {
-            if (result) |res| {
-                new_result = try std.fmt.allocPrint(
-                    init.gpa, "{s} M {s}\n",
-                    .{ res, path });
-                init.gpa.free(res);
-            } else {
-                new_result = try std.fmt.allocPrint(
-                    init.gpa, " M {s}\n",
-                    .{ path });
-            }
-            result = new_result;
-        }
-        if ((status & c.GIT_STATUS_WT_DELETED) != 0) {
-            if (result) |res| {
-                new_result = try std.fmt.allocPrint(
-                    init.gpa, "{s} D {s}\n",
-                    .{ res, path });
-                init.gpa.free(res);
-            } else {
-                new_result = try std.fmt.allocPrint(
-                    init.gpa, " D {s}\n",
-                    .{ path });
-            }
-            result = new_result;
-        }
-    }
-    defer if (result) |res| init.gpa.free(res);
+            action = "Modified";
+        } else if ((status & c.GIT_STATUS_INDEX_NEW) != 0) {
+            action = "Added";
+        } else if ((status & c.GIT_STATUS_INDEX_DELETED) != 0) {
+            action = "Dropped";
+        } else continue;
 
-    msg.* = try init.gpa.dupe(u8, if (result) |res| res else "");
+        // Add a line describing action on the ith entry
+        const new_result = try std.fmt.allocPrint(
+            init.gpa, "{s}  {s}\t{s}\n",
+            .{ msg.*, action, path });
+        init.gpa.free(msg.*);
+        msg.* = new_result;
+    }
 }
 
+// Stage → tree → commit → push. Every sync is immediately pushed to keep
+// remotes current across machines — no local-only commits
 pub fn handleSync(
     init: std.process.Init,
     repo: ?*c.git_repository,
     subject: []const u8,
     body: ?[]const u8,
-    err_msg: *[]const u8
+    msg: *[]const u8
 ) !void {
     var index: ?*c.git_index = null;
-    if (c.git_repository_index(&index, repo) != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "failed to get repo index");
+    const index_rc = c.git_repository_index(&index, repo);
+    if (index_rc != 0) {
+        const err = c.git_error_last();
+
+        const detail = if (err != null)
+            std.mem.sliceTo(err.*.message, 0)
+        else
+            "unknown libgit2 error";
+        std.debug.print("git_repository_index: {s}\n", .{detail});
+
+        msg.* = try init.gpa.dupe(u8, "failed to get repo index");
         return error.GitError;
     }
     defer c.git_index_free(index);
 
+    // persist index before writing tree
+    _ = c.git_index_write(index);
+
+    // Serialize the index into a tree object in the object store
     var tree_oid: c.git_oid = undefined;
-    if (c.git_index_write_tree(&tree_oid, index) != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "failed to write tree");
+    const write_rc = c.git_index_write_tree(&tree_oid, index);
+    if (write_rc != 0) {
+        const err = c.git_error_last();
+
+        const detail = if (err != null)
+            std.mem.sliceTo(err.*.message, 0)
+        else
+            "unknown libgit2 error";
+        std.debug.print("git_index_write_tree: {s}\n", .{detail});
+
+        msg.* = try init.gpa.dupe(u8, "failed to write tree");
         return error.GitError;
     }
 
+    // git_commit_create needs a *git_tree, not a bare OID
     var tree: ?*c.git_tree = null;
-    if (c.git_tree_lookup(&tree, repo, &tree_oid) != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "failed to lookup tree");
+    const tree_lookup_rc = c.git_tree_lookup(&tree, repo, &tree_oid);
+    if (tree_lookup_rc != 0) {
+        const err = c.git_error_last();
+
+        const detail = if (err != null)
+            std.mem.sliceTo(err.*.message, 0)
+        else
+            "unknown libgit2 error";
+        std.debug.print("git_tree_lookup: {s}\n", .{detail});
+
+        msg.* = try init.gpa.dupe(u8, "failed to lookup tree");
         return error.GitError;
     }
     defer c.git_tree_free(tree);
 
+    // Set message as standard git subject/body format
     const message = if (body) |b|
         try std.fmt.allocPrintSentinel(init.gpa, "{s}\n\n{s}\n", .{ subject, b }, 0)
     else
         try std.fmt.allocPrintSentinel(init.gpa, "{s}\n", .{subject}, 0);
     defer init.gpa.free(message);
 
+    // Reads user.name and user.email from repo config.
     var sig: ?*c.git_signature = null;
     if (c.git_signature_default(&sig, repo) != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "failed to get git signature, is user.name and user.email set?");
+        msg.* = try init.gpa.dupe(u8, "failed to get git signature, is user.name and user.email set?");
         return error.GitError;
     }
     defer c.git_signature_free(sig);
 
+    // Root commit if no HEAD yet (first sync), otherwise chain off current HEAD.
     var parent: ?*c.git_commit = null;
     var head_ref: ?*c.git_reference = null;
     const has_head = c.git_repository_head(&head_ref, repo) == 0;
     if (has_head) {
         defer c.git_reference_free(head_ref);
         const head_oid: ?*const c.git_oid = c.git_reference_target(head_ref);
-        _ = c.git_commit_lookup(&parent, repo, head_oid);
+        if (c.git_commit_lookup(&parent, repo, head_oid) != 0) {
+            msg.* = try init.gpa.dupe(u8, "failed to lookup parent commit");
+            return error.GitError;
+        }
     }
     defer if (parent != null) c.git_commit_free(parent);
 
@@ -157,125 +169,264 @@ pub fn handleSync(
     const parent_count: usize = if (has_head) 1 else 0;
 
     var commit_oid: c.git_oid = undefined;
-    if (c.git_commit_create(
+    const commit_rc = c.git_commit_create(
         &commit_oid,
         repo,
         "HEAD",
         sig,
         sig,
-        null,
+        null, // encoding: null defaults to UTF-8
         message,
         tree,
         parent_count,
         if (parent_count > 0) @ptrCast(&parents) else null,
-    ) != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "failed to create commit");
+    );
+    if (commit_rc != 0) {
+        const err = c.git_error_last();
+
+        const detail = if (err != null)
+            std.mem.sliceTo(err.*.message, 0)
+        else
+            "unknown libgit2 error";
+        std.debug.print("git_commit_create: {s}\n", .{detail});
+
+        msg.* = try init.gpa.dupe(u8, "failed to create commit");
         return error.GitError;
     }
 
-    // Push to origin
+    // Look up fresh each time so URL changes in config are picked up.
     var remote_obj: ?*c.git_remote = null;
-    if (c.git_remote_lookup(&remote_obj, repo, "origin") != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "failed to lookup remote");
+    const remote_lookup_rc = c.git_remote_lookup(&remote_obj, repo, "origin");
+    if (remote_lookup_rc != 0) {
+        const err = c.git_error_last();
+
+        const detail = if (err != null)
+            std.mem.sliceTo(err.*.message, 0)
+        else
+            "unknown libgit2 error";
+        std.debug.print("git_remote_lookup: {s}\n", .{detail});
+
+        msg.* = try init.gpa.dupe(u8, "failed to lookup remote");
         return error.GitError;
     }
     defer c.git_remote_free(remote_obj);
 
-    const refspecs = [_][*:0]const u8{"refs/heads/master:refs/heads/master"};
+    // Explicit refspec since tracking may not be configured on a fresh repo.
+    const refspecs = [_][*:0]const u8{"refs/heads/main:refs/heads/main"};
     const refspec_array = c.git_strarray{
         .strings = @constCast(@ptrCast(&refspecs)),
         .count = 1,
     };
 
-    if (c.git_remote_push(remote_obj, &refspec_array, null) != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "failed to push to remote");
+    var callbacks: c.git_remote_callbacks = undefined;
+    _ = c.git_remote_init_callbacks(&callbacks, c.GIT_REMOTE_CALLBACKS_VERSION);
+    callbacks.credentials = credentialCallback;
+
+    var push_opts: c.git_push_options = undefined;
+    _ = c.git_push_options_init(&push_opts, c.GIT_PUSH_OPTIONS_VERSION);
+    push_opts.callbacks = callbacks;
+
+    const push_rc = c.git_remote_push(remote_obj, &refspec_array, &push_opts);
+    if (push_rc != 0) {
+        const err = c.git_error_last();
+
+        const detail = if (err != null)
+            std.mem.sliceTo(err.*.message, 0)
+        else
+            "unknown libgit2 error";
+        std.debug.print("git_remote_push: {s}\n", .{detail});
+
+        msg.* = try init.gpa.dupe(u8, "failed to push to remote");
         return error.GitError;
     }
 }
 
+fn credentialCallback(
+    out: [*c]?*c.git_credential,
+    url: [*c]const u8,
+    username_from_url: [*c]const u8,
+    allowed_types: c_uint,
+    payload: ?*anyopaque,
+) callconv(.c) c_int {
+    _ = url;
+    _ = payload;
+
+    // Try SSH agent first — it handles key management without us touching keys
+    if (allowed_types & c.GIT_CREDENTIAL_SSH_KEY != 0) {
+        return c.git_credential_ssh_key_from_agent(out, username_from_url);
+    }
+
+    // Fallback: nothing we can do
+    return c.GIT_EAUTH;
+}
+
+// Set up a detached-gitdir repo with $HOME as the worktree — the standard
+// "bare repo dotfile" trick, keeping git internals out of $HOME entirely
 pub fn handleInit(
     init: std.process.Init,
     repo: *?*c.git_repository,
     remote: []const u8,
-    err_msg: *[]const u8
+    msg: *[]const u8
 ) !void {
     const remote_z = try init.gpa.dupeSentinel(u8, remote, 0);
     defer init.gpa.free(remote_z);
 
-    const home = std.c.getenv("HOME").?;
+    const home = mem.span(std.c.getenv("HOME") orelse {
+        msg.* = try init.gpa.dupe(u8, "HOME is not set");
+        return error.GitError;
+    });
+
+    // Tucked into ~/.local/share/configz rather than a visible .git in $HOME
     const repo_path = try std.fmt.allocPrintSentinel(init.gpa, config.bare_repo_path_fmt, .{home}, 0);
     defer init.gpa.free(repo_path);
 
-    const init_err = c.git_repository_init(repo, repo_path, 1);
-    if (init_err != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "failed to create bare repo");
+    var opts: c.git_repository_init_options = undefined;
+    _ = c.git_repository_init_options_init(&opts, c.GIT_REPOSITORY_INIT_OPTIONS_VERSION);
+
+    // NO_DOTGIT_DIR: no .git symlink in worktree
+    // MKPATH: create full gitdir hierarchy
+    opts.flags = c.GIT_REPOSITORY_INIT_NO_DOTGIT_DIR | c.GIT_REPOSITORY_INIT_MKDIR | c.GIT_REPOSITORY_INIT_MKPATH;
+    opts.workdir_path = @ptrCast(home);
+    opts.initial_head = "main";
+
+    // libgit2 is supposed to create the parent dirs itself but won't
+    std.Io.Dir.cwd().createDirPath(init.io, repo_path) catch |err| {
+        msg.* = try std.fmt.allocPrint(init.gpa, "Failed to create {s}: {s}", .{repo_path, @errorName(err)});
+        return err;
+    };
+
+    const init_rc = c.git_repository_init_ext(repo, repo_path, &opts);
+    if (init_rc != 0) {
+        const err = c.git_error_last();
+        const detail = if (err != null)
+            std.mem.sliceTo(err.*.message, 0)
+        else
+            "unknown libgit2 error";
+        std.debug.print("git_repository_init_ext: {s}\n", .{detail});
+
+        msg.* = try init.gpa.dupe(u8, "failed to create bare-style repo");
         return error.GitError;
     }
 
-    _ = c.git_repository_set_workdir(repo.*, home, 0);
-
     var remote_obj: ?*c.git_remote = null;
-    const remote_err = c.git_remote_create(&remote_obj, repo.*, "origin", remote_z);
-    if (remote_err != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "failed to create remote");
+    const remote_rc = c.git_remote_create(&remote_obj, repo.*, "origin", remote_z);
+    if (remote_rc != 0) {
+        const err = c.git_error_last();
+
+        const detail = if (err != null)
+            std.mem.sliceTo(err.*.message, 0)
+        else
+            "unknown libgit2 error";
+        std.debug.print("git_remote_create: {s}\n", .{detail});
+
+        msg.* = try init.gpa.dupe(u8, "failed to create remote");
         return error.GitError;
     }
     defer c.git_remote_free(remote_obj);
 
     var cfg: ?*c.git_config = null;
-    _ = c.git_repository_config(&cfg, repo.*);
+    if (c.git_repository_config(&cfg, repo.*) != 0) {
+        msg.* = try init.gpa.dupe(u8, "failed to get repo config");
+        return error.GitError;
+    }
     defer c.git_config_free(cfg);
-    _ = c.git_config_set_bool(cfg, "core.bare", 0);
-    _ = c.git_config_set_string(cfg, "core.worktree", home);
+
+    // Suppress untracked files — only explicitly added paths should appear in status
     _ = c.git_config_set_string(cfg, "status.showUntrackedFiles", "no");
+
+    // Set up tracking so push/pull work without explicit refspecs
+    _ = c.git_config_set_string(cfg, "branch.main.remote", "origin");
+    _ = c.git_config_set_string(cfg, "branch.main.merge", "refs/heads/main");
 }
 
+// Stage requested paths into the index, replacing added_paths with only those
+// that succeeded. Partial failure is allowed — failures are collected and
+// returned as a single error message after the index is written
 pub fn handleAdd(
     init: std.process.Init,
     repo: ?*c.git_repository,
-    args: []const []const u8,
-    err_msg: *[]const u8,
-    added_paths: *std.ArrayList([]const u8)
+    added_paths: *std.ArrayList([]const u8),
+    msg: *[]const u8,
 ) !void {
-    const home = std.c.getenv("HOME").?;
-    const repo_path = try std.fmt.allocPrintSentinel(init.gpa, config.bare_repo_path_fmt, .{home}, 0);
-    defer init.gpa.free(repo_path);
+    const home = mem.span(std.c.getenv("HOME") orelse {
+        msg.* = try init.gpa.dupe(u8, "HOME is not set");
+        return error.GitError;
+    });
 
-    // Get the index
     var index: ?*c.git_index = null;
-    if (c.git_repository_index(&index, repo) != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "failed to get repo index");
+    const index_rc = c.git_repository_index(&index, repo);
+    if (index_rc != 0) {
+        const err = c.git_error_last();
+
+        const detail = if (err != null)
+            std.mem.sliceTo(err.*.message, 0)
+        else
+            "unknown libgit2 error";
+        std.debug.print("git_repository_index: {s}\n", .{detail});
+
+        msg.* = try init.gpa.dupe(u8, "failed to get repo index");
         return error.GitError;
     }
     defer c.git_index_free(index);
 
-    // Add each file by path relative to HOME
-    var buf: [4096]u8 = undefined;
-    var pos: usize = 0;
-    for (args) |file| {
-        addPath(init, repo.?, index.?, home, file, &buf, &pos) catch continue;
-        try added_paths.append(init.gpa, try init.gpa.dupe(u8, file));
+    var true_additions = try std.ArrayList([]const u8).initCapacity(init.gpa, added_paths.items.len);
+    var true_additions_owned = true;
+    // Disarmed once ownership transfers to added_paths below
+    errdefer if (true_additions_owned) {
+        for (true_additions.items) |item| init.gpa.free(item);
+        true_additions.deinit(init.gpa);
+    };
+
+    var err_list = try std.ArrayList(u8).initCapacity(init.gpa, 0);
+    defer err_list.deinit(init.gpa);
+
+    // Free failed paths and continue — errors are collected in err_list
+    for (added_paths.items) |file| {
+        if (addPath(init, repo.?, index.?, home, file, &err_list)) {
+            const file_dupe = try init.gpa.dupe(u8, file);
+            errdefer init.gpa.free(file_dupe);
+            try true_additions.append(init.gpa, file_dupe);
+        } else |_| {
+            init.gpa.free(file);
+        }
     }
-    if (pos > 0) {
-        err_msg.* = try std.fmt.allocPrint(init.gpa, "Some files failed to add:{s}", .{buf[0..pos]});
+
+    const write_rc = c.git_index_write(index);
+    if (write_rc != 0) {
+        const err = c.git_error_last();
+
+        const detail = if (err != null)
+            std.mem.sliceTo(err.*.message, 0)
+        else
+            "unknown libgit2 error";
+        std.debug.print("git_index_write: {s}\n", .{detail});
+
+        msg.* = try init.gpa.dupe(u8, "failed to write index");
         return error.GitError;
     }
 
-    // Persist the index
-    if (c.git_index_write(index) != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "failed to write index");
+    // Transfer ownership — added_paths now reflects what was actually staged
+    added_paths.deinit(init.gpa);
+    added_paths.* = true_additions;
+    true_additions_owned = false;
+
+    // Report any per-file failures as a single message after persisting successes
+    if (err_list.items.len > 0) {
+        msg.* = try std.fmt.allocPrint(init.gpa, "Some files failed to add:{s}", .{err_list.items});
         return error.GitError;
     }
 }
 
+// Recursively stage a path into the index. Directories are walked and each
+// file staged individually. rel_path is relative to home — libgit2 stores it
+// that way so paths in the index aren't machine-specific
 fn addPath(
     init: std.process.Init,
     repo: *c.git_repository,
     index: *c.git_index,
-    home: [*:0]const u8,
+    home: []const u8,
     rel_path: []const u8,
-    buf: []u8,
-    pos: *usize
+    err_list: *std.ArrayList(u8),
 ) !void {
     const full_path = try std.fmt.allocPrintSentinel(init.gpa, "{s}/{s}", .{ home, rel_path }, 0);
     defer init.gpa.free(full_path);
@@ -285,91 +436,163 @@ fn addPath(
         defer dir.close(init.io);
         var it = dir.iterate();
         while (try it.next(init.io)) |entry| {
+            // Skip .git dirs to avoid staging another repo's internals.
             if (entry.kind == .directory and std.mem.eql(u8, entry.name, ".git")) continue;
 
             const child_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{ rel_path, entry.name });
             defer init.gpa.free(child_path);
-            try addPath(init, repo, index, home, child_path, buf, pos);
+            try addPath(init, repo, index, home, child_path, err_list);
         }
-    } else |_| {
-        const file_z = try init.gpa.dupeSentinel(u8, rel_path, 0);
-        defer init.gpa.free(file_z);
+    } else |err| switch (err) {
+        error.NotDir => {
+            const file_z = try init.gpa.dupeSentinel(u8, rel_path, 0);
+            defer init.gpa.free(file_z);
 
-        var oid: c.git_oid = undefined;
-        if (c.git_blob_create_from_disk(&oid, repo, full_path) != 0) {
-            pos.* += (try std.fmt.bufPrint(buf[pos.*..], "\n ~> {s}: failed to create blob", .{rel_path})).len;
+            // Stat before blob creation so we have accurate metadata to populate
+            // the index entry — libgit2 doesn't fill this in automatically
+            var statx_buf: std.os.linux.Statx = undefined;
+            const statx_rc = std.os.linux.statx(
+                std.os.linux.AT.FDCWD,
+                full_path,
+                0,
+                .BASIC_STATS,
+                &statx_buf,
+            );
+            if (statx_rc != 0) {
+                const msg_ptr = strerror(@intCast(-@as(isize, @bitCast(statx_rc))));
+                const detail = std.mem.sliceTo(msg_ptr, 0);
+
+                try err_list.appendSlice(init.gpa, "\n ~> ");
+                try err_list.appendSlice(init.gpa, rel_path);
+                try err_list.appendSlice(init.gpa, ": ");
+                try err_list.appendSlice(init.gpa, detail);
+                return error.GitError;
+            }
+
+            // Write file contents into the object store as a blob
+            var oid: c.git_oid = undefined;
+            if (c.git_blob_create_from_disk(&oid, repo, full_path) != 0) {
+                try err_list.appendSlice(init.gpa, "\n ~> ");
+                try err_list.appendSlice(init.gpa, rel_path);
+                try err_list.appendSlice(init.gpa, ": failed to create blob");
+                return error.GitError;
+            }
+
+            // Build the index entry manually with stat metadata so git status
+            // can detect future changes by comparing mtime/size without re-hashing
+            var entry: c.git_index_entry = std.mem.zeroes(c.git_index_entry);
+            entry.path = file_z;
+            entry.id = oid;
+            entry.mode = @intCast(statx_buf.mode);
+            entry.file_size = @intCast(statx_buf.size);
+            entry.mtime.seconds = @intCast(statx_buf.mtime.sec);
+            entry.mtime.nanoseconds = @intCast(statx_buf.mtime.nsec);
+            entry.ctime.seconds = @intCast(statx_buf.ctime.sec);
+            entry.ctime.nanoseconds = @intCast(statx_buf.ctime.nsec);
+
+            if (c.git_index_add(index, &entry) != 0) {
+                try err_list.appendSlice(init.gpa, "\n ~> ");
+                try err_list.appendSlice(init.gpa, rel_path);
+                try err_list.appendSlice(init.gpa, ": failed to add");
+                return error.GitError;
+            }
+        },
+        else => {
+            try err_list.appendSlice(init.gpa, "\n ~> ");
+            try err_list.appendSlice(init.gpa, rel_path);
+            try err_list.appendSlice(init.gpa, ": failed to open");
             return error.GitError;
-        }
-
-        var statx_buf: std.os.linux.Statx = undefined;
-        _ = std.os.linux.statx(
-            std.os.linux.AT.FDCWD,
-            full_path,
-            0,
-            .BASIC_STATS,
-            &statx_buf,
-        );
-
-        var entry: c.git_index_entry = std.mem.zeroes(c.git_index_entry);
-        entry.path = file_z;
-        entry.mode = 0o100644;
-        entry.id = oid;
-        entry.mode = statx_buf.mode;
-        entry.file_size = @intCast(statx_buf.size);
-        entry.mtime.seconds = @intCast(statx_buf.mtime.sec);
-        entry.mtime.nanoseconds = @intCast(statx_buf.mtime.nsec);
-        entry.ctime.seconds = @intCast(statx_buf.ctime.sec);
-        entry.ctime.nanoseconds = @intCast(statx_buf.ctime.nsec);
-
-        if (c.git_index_add(index, &entry) != 0) {
-            pos.* += (try std.fmt.bufPrint(buf[pos.*..], "\n ~> {s}: failed to add", .{rel_path})).len;
-            return error.GitError;
-        }
+        },
     }
 }
 
+// Unstage requested paths from the index, replacing dropped_paths with only
+// those that succeeded. Partial failure is allowed — failures are collected
+// and reported after the index is written
 pub fn handleDrop(
     init: std.process.Init,
     repo: ?*c.git_repository,
-    args: []const []const u8,
-    err_msg: *[]const u8,
-    dropped_paths: *std.ArrayList([]const u8)
+    dropped_paths: *std.ArrayList([]const u8), // correct the rest
+    msg: *[]const u8,
 ) !void {
-    const home = std.c.getenv("HOME").?;
-    const repo_path = try std.fmt.allocPrintSentinel(init.gpa, config.bare_repo_path_fmt, .{home}, 0);
-    defer init.gpa.free(repo_path);
+    const home = mem.span(std.c.getenv("HOME") orelse {
+        msg.* = try init.gpa.dupe(u8, "HOME is not set");
+        return error.GitError;
+    });
 
     var index: ?*c.git_index = null;
-    if (c.git_repository_index(&index, repo) != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "failed to get repo index");
+    const index_rc = c.git_repository_index(&index, repo);
+    if (index_rc != 0) {
+        const err = c.git_error_last();
+
+        const detail = if (err != null)
+            std.mem.sliceTo(err.*.message, 0)
+        else
+            "unknown libgit2 error";
+        std.debug.print("git_repository_index: {s}\n", .{detail});
+
+        msg.* = try init.gpa.dupe(u8, "failed to get repo index");
         return error.GitError;
     }
     defer c.git_index_free(index);
 
-    var buf: [4096]u8 = undefined;
-    var pos: usize = 0;
-    for (args) |file| {
-        dropPath(init, index.?, home, file, &buf, &pos) catch continue;
-        try dropped_paths.append(init.gpa, try init.gpa.dupe(u8, file));
+    var true_drops = try std.ArrayList([]const u8).initCapacity(init.gpa, dropped_paths.items.len);
+    var true_drops_owned = true;
+    // Disarmed once ownership transfers to dropped_paths below
+    errdefer if (true_drops_owned) {
+        for (true_drops.items) |item| init.gpa.free(item);
+        true_drops.deinit(init.gpa);
+    };
+
+    var err_list = try std.ArrayList(u8).initCapacity(init.gpa, 0);
+    defer err_list.deinit(init.gpa);
+
+    // Free failed paths and continue — errors are collected in err_list
+    for (dropped_paths.items) |file| {
+        if (dropPath(init, index.?, home, file, &err_list)) {
+            const file_dupe = try init.gpa.dupe(u8, file);
+            errdefer init.gpa.free(file_dupe);
+            try true_drops.append(init.gpa, file_dupe);
+        } else |_| {
+            init.gpa.free(file);
+        }
     }
-    if (pos > 0) {
-        err_msg.* = try std.fmt.allocPrint(init.gpa, "Some files failed to be dropped:{s}", .{buf[0..pos]});
+
+    const write_rc = c.git_index_write(index);
+    if (write_rc != 0) {
+        const err = c.git_error_last();
+
+        const detail = if (err != null)
+            std.mem.sliceTo(err.*.message, 0)
+        else
+            "unknown libgit2 error";
+        std.debug.print("git_index_write: {s}\n", .{detail});
+
+        msg.* = try init.gpa.dupe(u8, "failed to write index");
         return error.GitError;
     }
 
-    if (c.git_index_write(index) != 0) {
-        err_msg.* = try init.gpa.dupe(u8, "failed to write index");
+    // Transfer ownership — dropped_paths now reflects what was actually unstaged
+    dropped_paths.deinit(init.gpa);
+    dropped_paths.* = true_drops;
+    true_drops_owned = false;
+
+    // Report per-file failures after persisting successes
+    if (err_list.items.len > 0) {
+        msg.* = try std.fmt.allocPrint(init.gpa, "Some files failed to be dropped:{s}", .{err_list.items});
         return error.GitError;
     }
 }
 
+// Recursively remove a path from the index. Mirrors addPath — directories are
+// walked and each file removed individually. Does not delete files from disk,
+// only unstages them.
 fn dropPath(
     init: std.process.Init,
     index: *c.git_index,
-    home: [*:0]const u8,
+    home: []const u8,
     rel_path: []const u8,
-    buf: []u8,
-    pos: *usize
+    err_list: *std.ArrayList(u8),
 ) !void {
     const full_path = try std.fmt.allocPrintSentinel(init.gpa, "{s}/{s}", .{ home, rel_path }, 0);
     defer init.gpa.free(full_path);
@@ -379,20 +602,30 @@ fn dropPath(
         defer dir.close(init.io);
         var it = dir.iterate();
         while (try it.next(init.io)) |entry| {
+            // Skip .git dirs to avoid touching another repo's internals.
             if (entry.kind == .directory and std.mem.eql(u8, entry.name, ".git")) continue;
             const child_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}", .{ rel_path, entry.name });
             defer init.gpa.free(child_path);
-            try dropPath(init, index, home, child_path, buf, pos);
+            try dropPath(init, index, home, child_path, err_list);
         }
-    } else |_| {
-        const file_z = try init.gpa.dupeSentinel(u8, rel_path, 0);
-        defer init.gpa.free(file_z);
+    } else |err| switch (err) {
+        error.NotDir => {
+            const file_z = try init.gpa.dupeSentinel(u8, rel_path, 0);
+            defer init.gpa.free(file_z);
 
-        std.log.debug("dropPath: removing '{s}' from index, result={d}",
-            .{rel_path, c.git_index_remove(index, file_z, 0)});
-        // if (c.git_index_remove(index, file_z, 0) != 0) {
-        //     pos.* += (try std.fmt.bufPrint(buf[pos.*..], "\n ~> {s}: failed to remove", .{rel_path})).len;
-        //     return error.GitError;
-        // }
+            std.log.debug("dropPath: removing '{s}' from index", .{rel_path});
+            if (c.git_index_remove(index, file_z, 0) != 0) {
+                try err_list.appendSlice(init.gpa, "\n ~> ");
+                try err_list.appendSlice(init.gpa, rel_path);
+                try err_list.appendSlice(init.gpa, ": failed to remove");
+                return error.GitError;
+            }
+        },
+        else => {
+            try err_list.appendSlice(init.gpa, "\n ~> ");
+            try err_list.appendSlice(init.gpa, rel_path);
+            try err_list.appendSlice(init.gpa, ": failed to open");
+            return error.GitError;
+        },
     }
 }

@@ -182,6 +182,7 @@ function cmd_purge {
 # Initializes a new bare repo at the default location and sets the given remote
 function cmd_init {
     [[ $# -gt 0 ]] || die "Usage: configz init <remote>"
+    [[ ! -d $REPO_DIR ]] || die "Configz repo already exists"
 
     local payload response ok
     payload=$(jq -cn \
@@ -216,6 +217,9 @@ function cmd_install {
         return 1
     fi
     if git clone --bare "$remote" "$REPO_DIR"; then
+        # Set settings
+        git config status.showUntrackedFiles no
+
         cmd_git checkout
     fi
 }
