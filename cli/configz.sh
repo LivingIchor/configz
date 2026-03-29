@@ -347,8 +347,6 @@ case "${1:-}" in
     ""|status|sync|purge|init|add|drop)
         [[ -n "$XDG_RUNTIME_DIR" ]] || die "XDG_RUNTIME_DIR is not set"
         SOCK="$XDG_RUNTIME_DIR/configz.sock"
-
-        ping_server
         ;;
     *)
         ;;
@@ -356,12 +354,15 @@ esac
 
 case "${1:-}" in
     ""|status)
+        ping_server
         cmd_status
         ;;
     sync)
+        ping_server
         shift; cmd_sync "$@"
         ;;
     purge)
+        ping_server
         shift; cmd_purge "$@"
         ;;
     init)
@@ -382,9 +383,11 @@ case "${1:-}" in
         shift; cmd_install "$@"
         ;;
     add)
+        ping_server
         shift; cmd_add "$@"
         ;;
     drop)
+        ping_server
         shift; cmd_drop "$@"
         ;;
     help|--help|-h)

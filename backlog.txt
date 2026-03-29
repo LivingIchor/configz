@@ -1,5 +1,4 @@
 TODO:
-⇒ Follow no news is good news principle
 • Remove socket from purge and don't exit server (changed my mind)
 • Add common config definition
 • Expand logging and testing and error handling

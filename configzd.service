@@ -1,0 +1,11 @@
+[Unit]
+Description=configz dotfile daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/configzd
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

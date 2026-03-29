@@ -629,7 +629,7 @@ fn addPath(
             const statx_rc = std.os.linux.statx(
                 std.os.linux.AT.FDCWD,
                 full_path,
-                0,
+                std.os.linux.AT.SYMLINK_NOFOLLOW,
                 .BASIC_STATS,
                 &statx_buf,
             );
@@ -644,21 +644,45 @@ fn addPath(
                 return error.GitError;
             }
 
+            // In addPath, after statx, before blob creation
+            const is_symlink = (statx_buf.mode & std.os.linux.S.IFMT) == std.os.linux.S.IFLNK;
+
             // Write file contents into the object store as a blob
             var oid: c.git_oid = undefined;
-            if (c.git_blob_create_from_disk(&oid, repo, full_path) != 0) {
-                try err_list.appendSlice(init.gpa, "\n ~> ");
-                try err_list.appendSlice(init.gpa, rel_path);
-                try err_list.appendSlice(init.gpa, ": failed to create blob");
-                return error.GitError;
+            var entry: c.git_index_entry = std.mem.zeroes(c.git_index_entry);
+            if (is_symlink) {
+                // Read the link target and store it as the blob contents
+                var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const rc: isize = @bitCast(std.os.linux.readlink(full_path, &link_buf, link_buf.len));
+                if (rc < 0) {
+                    try err_list.appendSlice(init.gpa, "\n ~> ");
+                    try err_list.appendSlice(init.gpa, rel_path);
+                    try err_list.appendSlice(init.gpa, ": failed to read symlink");
+                    return error.GitError;
+                }
+                const link_target = link_buf[0..@intCast(rc)];
+
+                if (c.git_blob_create_from_buffer(&oid, repo, link_target.ptr, link_target.len) != 0) {
+                    try err_list.appendSlice(init.gpa, "\n ~> ");
+                    try err_list.appendSlice(init.gpa, rel_path);
+                    try err_list.appendSlice(init.gpa, ": failed to create symlink blob");
+                    return error.GitError;
+                }
+                entry.mode = 0o120000;
+            } else {
+                if (c.git_blob_create_from_disk(&oid, repo, full_path) != 0) {
+                    try err_list.appendSlice(init.gpa, "\n ~> ");
+                    try err_list.appendSlice(init.gpa, rel_path);
+                    try err_list.appendSlice(init.gpa, ": failed to create blob");
+                    return error.GitError;
+                }
+                entry.mode = @intCast(statx_buf.mode);
             }
 
             // Build the index entry manually with stat metadata so git status
             // can detect future changes by comparing mtime/size without re-hashing
-            var entry: c.git_index_entry = std.mem.zeroes(c.git_index_entry);
             entry.path = file_z;
             entry.id = oid;
-            entry.mode = @intCast(statx_buf.mode);
             entry.file_size = @intCast(statx_buf.size);
             entry.mtime.seconds = @intCast(statx_buf.mtime.sec);
             entry.mtime.nanoseconds = @intCast(statx_buf.mtime.nsec);
