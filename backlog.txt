@@ -1,14 +1,7 @@
 TODO:
-⇒ Clean up code and add comments
- ✓ ./PKGBUILD
- ✓ cli/configz.sh
- ✓ src/main.zig
- ✓ src/commands.zig
- ✓ src/watch-tree.zig
- ✓ src/auto.zig
-⇒ fix status
-• fix sync credintials
+⇒ fix sync credintials
 • fix socket error message
+• Follow no news is good news principle
 • Remove socket from purge and don't exit server (changed my mind)
 • Add common config definition
 • Expand logging and testing and error handling

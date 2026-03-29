@@ -6,6 +6,77 @@ const config = @import("config.zig");
 
 extern fn strerror(errnum: c_int) [*:0]const u8;
 
+pub const MsgTag = enum {
+    // CLI → daemon
+    status,
+    init,
+    add,
+    drop,
+    sync,
+    credentials,
+
+    // daemon → CLI
+    ok,
+    err,
+    need_credentials,
+};
+
+pub fn Packet(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        tag: MsgTag,
+        payload: T,
+
+        pub fn init(payload: T) Self {
+            const tag = switch (T) {
+                StatusPayload => MsgTag.status,
+                InitPayload => MsgTag.init,
+                AddPayload => MsgTag.add,
+                DropPayload => MsgTag.drop,
+                SyncPayload => MsgTag.sync,
+                CredentialsPayload => MsgTag.credentials,
+
+                OkPayload => MsgTag.ok,
+                ErrPayload => MsgTag.err,
+                NeedCredentialsPayload => MsgTag.need_credentials,
+                else => @compileError("unsupported payload type"),
+            };
+
+            return .{ .tag = tag, .payload = payload };
+        }
+
+        pub fn initMsg(comptime tag: MsgTag, message: []const u8) Self {
+            switch (tag) {
+                MsgTag.ok => {
+                    if (T != OkPayload) @compileError("initMsg: tag must match payload type");
+                    return Packet(T).init(T{ .message = message });
+                },
+                MsgTag.err => {
+                    if (T != ErrPayload) @compileError("initMsg: tag must match payload type");
+                    return Packet(T).init(T{ .message = message });
+                },
+                else => @compileError("initMsg only takes message type packets"),
+            }
+        }
+    };
+}
+
+// Concrete payload types
+pub const StatusPayload = struct {};
+pub const InitPayload = struct { remote: []const u8 };
+pub const AddPayload = struct { paths: [][]const u8 };
+pub const DropPayload = struct { paths: [][]const u8 };
+pub const SyncPayload = struct { subject: []const u8, body: []const u8 };
+pub const CredentialsPayload = struct { username: []const u8, password: []const u8, };
+
+pub const OkPayload = struct { message: []const u8 };
+pub const ErrPayload = struct { message: []const u8 };
+pub const NeedCredentialsPayload = struct { url: []const u8 };
+
+// First pass: just get the tag
+pub const TagOnly = struct { tag: MsgTag };
+
 
 // ── Cmd Handlers ─────────────────────────────────────────────────────────────────────────────────
 
@@ -82,6 +153,8 @@ pub fn handleSync(
     repo: ?*c.git_repository,
     subject: []const u8,
     body: ?[]const u8,
+    streamin: *std.Io.Reader,
+    streamout: *std.Io.Writer,
     msg: *[]const u8
 ) !void {
     var index: ?*c.git_index = null;
@@ -218,9 +291,16 @@ pub fn handleSync(
         .count = 1,
     };
 
+    var cred_payload = CredCallbackPayload{
+        .io = init.io,
+        .streamin = streamin,
+        .streamout = streamout,
+    };
+
     var callbacks: c.git_remote_callbacks = undefined;
     _ = c.git_remote_init_callbacks(&callbacks, c.GIT_REMOTE_CALLBACKS_VERSION);
     callbacks.credentials = credentialCallback;
+    callbacks.payload = &cred_payload;
 
     var push_opts: c.git_push_options = undefined;
     _ = c.git_push_options_init(&push_opts, c.GIT_PUSH_OPTIONS_VERSION);
@@ -241,6 +321,13 @@ pub fn handleSync(
     }
 }
 
+const CredCallbackPayload = struct {
+    io: std.Io,
+    streamin: *std.Io.Reader,
+    streamout: *std.Io.Writer,
+    attempts: u8 = 0,
+};
+
 fn credentialCallback(
     out: [*c]?*c.git_credential,
     url: [*c]const u8,
@@ -248,15 +335,97 @@ fn credentialCallback(
     allowed_types: c_uint,
     payload: ?*anyopaque,
 ) callconv(.c) c_int {
-    _ = url;
-    _ = payload;
+    const ctx: *CredCallbackPayload = @ptrCast(@alignCast(payload));
+    ctx.attempts += 1;
+    if (ctx.attempts > 3) return c.GIT_EAUTH;
 
-    // Try SSH agent first — it handles key management without us touching keys
     if (allowed_types & c.GIT_CREDENTIAL_SSH_KEY != 0) {
-        return c.git_credential_ssh_key_from_agent(out, username_from_url);
+        const home = std.mem.span(std.c.getenv("HOME") orelse return c.GIT_EAUTH);
+        const key_names = [_][]const u8{ "id_ed25519", "id_rsa", "id_ecdsa" };
+        for (key_names) |name| {
+            var pub_buf: [512]u8 = undefined;
+            var priv_buf: [512]u8 = undefined;
+
+            const pub_path = std.fmt.bufPrintZ(&pub_buf, "{s}/.ssh/{s}.pub", .{ home, name })
+                catch continue;
+            const priv_path = std.fmt.bufPrintZ(&priv_buf, "{s}/.ssh/{s}", .{ home, name })
+                catch continue;
+
+            _ = std.Io.Dir.openFileAbsolute(ctx.io, priv_path, .{}) catch continue;
+
+            // Prompt CLI for passphrase — reuse need_credentials, password = passphrase
+            var req_buf: [1024]u8 = undefined;
+            const req = std.fmt.bufPrint(&req_buf,
+                "{{\"tag\":\"need_credentials\",\"payload\":{{\"url\":\"{s}\"}}}}\n",
+                .{priv_path}) catch return c.GIT_EAUTH;
+            ctx.streamout.writeAll(req) catch return c.GIT_EAUTH;
+            ctx.streamout.flush() catch return c.GIT_EAUTH;
+
+            const resp_str = ctx.streamin.takeDelimiter('\n') catch return c.GIT_EAUTH;
+            const resp = resp_str orelse return c.GIT_EAUTH;
+
+            var fba_buf: [512]u8 = undefined;
+            var passphrase_buf: [256]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+            const parsed = std.json.parseFromSlice(
+                struct { tag: []const u8, payload: CredentialsPayload },
+                fba.allocator(), resp, .{}) catch return c.GIT_EAUTH;
+
+            const passphrase = parsed.value.payload.password;
+            @memcpy(passphrase_buf[0..passphrase.len], passphrase);
+            passphrase_buf[passphrase.len] = 0;
+
+            const rc = c.git_credential_ssh_key_new(
+                out, username_from_url, pub_path, priv_path,
+                @ptrCast(&passphrase_buf),
+            );
+            if (rc == 0) return 0;
+        }
     }
 
-    // Fallback: nothing we can do
+    // Fall back to asking the CLI for credentials
+    if (allowed_types & c.GIT_CREDENTIAL_USERPASS_PLAINTEXT != 0) {
+        const url_str = std.mem.span(url);
+
+        // Send need_credentials to CLI
+        var buf: [1024]u8 = undefined;
+        const req = std.fmt.bufPrint(&buf,
+            "{{\"tag\":\"need_credentials\",\"payload\":{{\"url\":\"{s}\"}}}}\n",
+            .{url_str}) catch return c.GIT_EAUTH;
+        ctx.streamout.writeAll(req) catch return c.GIT_EAUTH;
+        ctx.streamout.flush() catch return c.GIT_EAUTH;
+
+        // Block reading credentials response
+        const resp_str = ctx.streamin.takeDelimiter('\n') catch return c.GIT_EAUTH;
+        const resp = resp_str orelse return c.GIT_EAUTH;
+
+        // Parse the credentials packet
+        // Using a simple fixed buffer approach since we can't allocate in a C callback
+        var fba_buf: [512]u8 = undefined;
+        var username_buf: [256]u8 = undefined;
+        var password_buf: [256]u8 = undefined;
+
+        // You'll need to parse the JSON here — simplest is a lightweight parse
+        // or just use std.json.parseFromSliceLeaky with a fixed buffer allocator
+        var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+        const parsed = std.json.parseFromSlice(
+            struct { tag: []const u8, payload: CredentialsPayload },
+            fba.allocator(), resp, .{}) catch return c.GIT_EAUTH;
+        const creds = parsed.value.payload;
+
+        // Copy to sentinel buffers for libgit2
+        @memcpy(username_buf[0..creds.username.len], creds.username);
+        username_buf[creds.username.len] = 0;
+        @memcpy(password_buf[0..creds.password.len], creds.password);
+        password_buf[creds.password.len] = 0;
+
+        return c.git_credential_userpass_plaintext_new(
+            out,
+            @ptrCast(&username_buf),
+            @ptrCast(&password_buf),
+        );
+    }
+
     return c.GIT_EAUTH;
 }
 

@@ -110,16 +110,16 @@ function sync_watched_dirs {
 
 # Sends a status request to configzd and prints the current state of tracked files
 function cmd_status {
-    local payload response ok
-    payload=$(jq -cn '{"cmd": "status", "args": []}')
+    local payload response tag
+    payload=$(jq -cn '{"tag": "status", "payload": {}}')
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
-    ok=$(echo "$response" | jq -r '.ok')
+    tag=$(echo "$response" | jq -r '.tag')
 
-    if [[ "$ok" == "true" ]]; then
-        echo "$response" | jq -r '.output'
-    elif [[ "$ok" == "false" ]]; then
-        die "$(echo "$response" | jq -r '.output')"
+    if [[ "$tag" == "ok" ]]; then
+        echo "$response" | jq -r '.payload.message'
+    elif [[ "$tag" == "err" ]]; then
+        die "$(echo "$response" | jq -r '.payload.message')"
     else
         die "Malformed response from configzd"
     fi
@@ -140,28 +140,59 @@ function cmd_sync {
     done
     shift $((OPTIND - 1))
 
-    local payload response ok
+    local payload
     if [[ -n "$body" ]]; then
         payload=$(jq -cn \
             --arg subject "$subject" \
             --arg body "$body" \
-            '{"cmd": "sync", "args": [$subject, $body]}')
+            '{"tag": "sync", "payload": {"subject": $subject, "body": $body}}')
     else
         payload=$(jq -cn \
             --arg subject "$subject" \
-            '{"cmd": "sync", "args": [$subject]}')
+            '{"tag": "sync", "payload": {"subject": $subject, "body": ""}}')
     fi
 
-    response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
-    ok=$(echo "$response" | jq -r '.ok')
+    # Persistent bidirectional connection — SOCK_CONN[0] is read, [1] is write
+    coproc SOCK_CONN { socat - UNIX-CONNECT:"$SOCK"; }
 
-    if [[ "$ok" == "true" ]]; then
-        echo -e "${GRN}Sync successful${RST}"
-    elif [[ "$ok" == "false" ]]; then
-        die "$(echo "$response" | jq -r '.output')"
-    else
-        die "Malformed response from configzd"
-    fi
+    echo "$payload" >&"${SOCK_CONN[1]}"
+
+    while IFS= read -r -u "${SOCK_CONN[0]}" response; do
+        local tag
+        tag=$(echo "$response" | jq -r '.tag')
+
+        case "$tag" in
+            need_credentials)
+                local url
+                url=$(echo "$response" | jq -r '.payload.url')
+                echo "Credentials needed for: $url"
+
+                printf "Username: "
+                read -r username < /dev/tty
+
+                printf "Password: "
+                read -rs password < /dev/tty
+                echo
+
+                local cred_payload
+                cred_payload=$(jq -cn \
+                    --arg u "$username" \
+                    --arg p "$password" \
+                    '{"tag": "credentials", "payload": {"username": $u, "password": $p}}')
+                echo "$cred_payload" >&"${SOCK_CONN[1]}"
+                ;;
+            ok)
+                echo -e "${GRN}Sync successful${RST}"
+                break
+                ;;
+            err)
+                die "$(echo "$response" | jq -r '.payload.message')"
+                ;;
+        esac
+    done
+
+    exec {SOCK_CONN[1]}>&-
+    wait "${SOCK_CONN_PID}" 2>/dev/null || true
 }
 
 # Permanently deletes the local bare repo and all configz data
@@ -184,18 +215,18 @@ function cmd_init {
     [[ $# -gt 0 ]] || die "Usage: configz init <remote>"
     [[ ! -d $REPO_DIR ]] || die "Configz repo already exists"
 
-    local payload response ok
+    local payload response tag
     payload=$(jq -cn \
         --arg remote "$1" \
-        '{"cmd": "init", "args": [$remote]}')
+        '{"tag": "init", "payload": {"remote": $remote}}')
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
-    ok=$(echo "$response" | jq -r '.ok')
+    tag=$(echo "$response" | jq -r '.tag')
 
-    if [[ "$ok" == "true" ]]; then
+    if [[ "$tag" == "ok" ]]; then
         echo -e "${GRN}Successfully initialized${RST}"
-    elif [[ "$ok" == "false" ]]; then
-        die "$(echo "$response" | jq -r '.output')"
+    elif [[ "$tag" == "err" ]]; then
+        die "$(echo "$response" | jq -r '.payload.message')"
     else
         die "Malformed response from configzd"
     fi
@@ -234,18 +265,18 @@ function cmd_add {
     done
     sync_watched_dirs "add" "$WATCH_FILE" "${resolved[@]}"
 
-    local payload response ok
+    local payload response tag
     payload=$(jq -cn \
-        --args '{"cmd": "add", "args": $ARGS.positional}' \
+        --args '{"tag": "add", "payload": {"paths": $ARGS.positional}}' \
         -- "${resolved[@]}")
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
-    ok=$(echo "$response" | jq -r '.ok')
+    tag=$(echo "$response" | jq -r '.tag')
 
-    if [[ "$ok" == "true" ]]; then
+    if [[ "$tag" == "ok" ]]; then
         echo -e "${GRN}Successfully added files${RST}"
-    elif [[ "$ok" == "false" ]]; then
-        die "$(echo "$response" | jq -r '.output')"
+    elif [[ "$tag" == "err" ]]; then
+        die "$(echo "$response" | jq -r '.payload.message')"
     else
         die "Malformed response from configzd"
     fi
@@ -261,18 +292,18 @@ function cmd_drop {
     done
     sync_watched_dirs "drop" "$WATCH_FILE" "${resolved[@]}"
 
-    local payload response ok
+    local payload response tag
     payload=$(jq -cn \
-        --args '{"cmd": "drop", "args": $ARGS.positional}' \
+        --args '{"tag": "drop", "payload": {"paths": $ARGS.positional}}' \
         -- "${resolved[@]}")
 
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
-    ok=$(echo "$response" | jq -r '.ok')
+    tag=$(echo "$response" | jq -r '.tag')
 
-    if [[ "$ok" == "true" ]]; then
+    if [[ "$tag" == "ok" ]]; then
         echo -e "${GRN}Successfully dropped files${RST}"
-    elif [[ "$ok" == "false" ]]; then
-        die "$(echo "$response" | jq -r '.output')"
+    elif [[ "$tag" == "err" ]]; then
+        die "$(echo "$response" | jq -r '.payload.message')"
     else
         die "Malformed response from configzd"
     fi

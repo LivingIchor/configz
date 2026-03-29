@@ -10,23 +10,196 @@ const auto = @import("auto.zig");
 
 // ── Socket Data ──────────────────────────────────────────────────────────────────────────────────
 
-const Command = enum {
-    status,
-    sync,
-    init,
-    add,
-    drop,
+pub const Response = union(enum) {
+    ok: cmds.Packet(cmds.OkPayload),
+    err: cmds.Packet(cmds.ErrPayload),
 };
 
-const Request = struct {
-    cmd: Command,
-    args: [][]const u8,
-};
+pub fn parsePacket(
+    init: std.process.Init,
+    repo: *?*c.git_repository,
+    pipe_fds: [2]i32,
+    streamin: *std.Io.Reader,
+    streamout: *std.Io.Writer,
+) !Response {
+    const json_str = try streamin.takeDelimiter('\n') orelse return error.NoJSON;
+    const json = std.mem.trimEnd(u8, json_str, "\n");
+    std.log.debug("Received len={d}: '{s}'", .{json.len, json});
+    if (json.len == 0) return error.NoJSON;
 
-const Response = struct {
-    ok: bool,
-    output: []const u8,
-};
+    const tag_only = std.json.parseFromSlice(
+        cmds.TagOnly, init.gpa, json, .{.ignore_unknown_fields = true}) catch |err| {
+        std.log.err("malformed packet: {}", .{err});
+        const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, "Malformed Request");
+        return Response{ .err = outgoing };
+    };
+    defer tag_only.deinit();
+
+    if (repo.* == null and tag_only.value.tag != .init) {
+        const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, "repo not initialized, run 'configz init <remote>' first");
+        return Response{ .err = outgoing };
+    }
+
+    var msg: []const u8 = "";
+    switch (tag_only.value.tag) {
+        .status => {
+            const incoming = std.json.parseFromSlice(
+                cmds.Packet(cmds.StatusPayload), init.gpa, json, .{.ignore_unknown_fields = true}) catch |err| {
+                std.log.err("malformed packet: {}", .{err});
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, "Malformed Request");
+                return Response{ .err =  outgoing };
+            };
+            defer incoming.deinit();
+
+            cmds.handleStatus(init, repo.*, &msg) catch |err| {
+                std.log.info("handleStatus error: {}", .{err});
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, msg);
+                return Response{ .err = outgoing };
+            };
+
+            std.log.info("handleStatus success", .{});
+            const outgoing = cmds.Packet(cmds.OkPayload).initMsg(.ok, msg);
+            return Response{ .ok = outgoing };
+        },
+        .init => {
+            if (repo.* != null) {
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, "repo already initialized");
+                return Response{ .err = outgoing };
+            }
+            const incoming = std.json.parseFromSlice(
+                cmds.Packet(cmds.InitPayload), init.gpa, json, .{.ignore_unknown_fields = true}) catch |err| {
+                std.log.err("malformed packet: {}", .{err});
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, "Malformed Request");
+                return Response{ .err =  outgoing };
+            };
+            defer incoming.deinit();
+
+            if (incoming.value.payload.remote.len == 0) {
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, "init requires a remote URL");
+                return Response{ .err = outgoing };
+            }
+
+            cmds.handleInit(init, repo, incoming.value.payload.remote, &msg) catch {
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, msg);
+                return Response{ .err = outgoing };
+            };
+
+            const thread = try std.Thread.spawn(.{},
+                auto.watchFilesWrapper, .{init, repo.*.?, pipe_fds[0]});
+            thread.detach();
+
+            const outgoing = cmds.Packet(cmds.OkPayload).initMsg(.ok, msg);
+            return Response{ .ok = outgoing };
+        },
+        .add => {
+            const incoming = std.json.parseFromSlice(
+                cmds.Packet(cmds.AddPayload), init.gpa, json, .{.ignore_unknown_fields = true}) catch |err| {
+                std.log.err("malformed packet: {}", .{err});
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, "Malformed Request");
+                return Response{ .err = outgoing };
+            };
+            defer incoming.deinit();
+
+            if (incoming.value.payload.paths.len < 1) {
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, "add requires at least one file");
+                return Response{ .err = outgoing };
+            }
+
+            // Construct list of potential additions
+            var added_paths = try std.ArrayList([]const u8)
+                .initCapacity(init.gpa, incoming.value.payload.paths.len);
+            try added_paths.appendSlice(init.gpa, incoming.value.payload.paths);
+            defer added_paths.deinit(init.gpa);
+            defer for (added_paths.items) |item| {
+                init.gpa.free(item);
+            };
+
+            // Attempts to add the list of files and sets the list of
+            // added files to actual added files
+            cmds.handleAdd(init, repo.*, &added_paths, &msg) catch {
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, msg);
+                return Response{ .err = outgoing };
+            };
+
+            for (added_paths.items) |file| {
+                const cmd = auto.WatchCmd.init(.add, file);
+                _ = std.os.linux.write(pipe_fds[1], @ptrCast(&cmd), @sizeOf(auto.WatchCmd));
+            }
+
+            const outgoing = cmds.Packet(cmds.OkPayload).initMsg(.ok, msg);
+            return Response{ .ok = outgoing };
+        },
+        .drop => {
+            const incoming = std.json.parseFromSlice(
+                cmds.Packet(cmds.DropPayload), init.gpa, json, .{.ignore_unknown_fields = true}) catch |err| {
+                std.log.err("malformed packet: {}", .{err});
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, "Malformed Request");
+                return Response{ .err = outgoing };
+            };
+            defer incoming.deinit();
+
+            if (incoming.value.payload.paths.len < 1) {
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, "drop requires at least one file");
+                return Response{ .err = outgoing };
+            }
+
+            // Construct list of potential drops
+            var dropped_paths = try std.ArrayList([]const u8)
+                .initCapacity(init.gpa, incoming.value.payload.paths.len);
+            try dropped_paths.appendSlice(init.gpa, incoming.value.payload.paths);
+            defer dropped_paths.deinit(init.gpa);
+            defer for (dropped_paths.items) |item| {
+                init.gpa.free(item);
+            };
+
+            // Attempts to drop the list of files and sets the list of
+            // dropped files to actual dropped files
+            cmds.handleDrop(init, repo.*, &dropped_paths, &msg) catch {
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, msg);
+                return Response{ .err = outgoing };
+            };
+
+            for (dropped_paths.items) |file| {
+                const cmd = auto.WatchCmd.init(.remove, file);
+                _ = std.os.linux.write(pipe_fds[1], @ptrCast(&cmd), @sizeOf(auto.WatchCmd));
+            }
+
+            const outgoing = cmds.Packet(cmds.OkPayload).initMsg(.ok, msg);
+            return Response{ .ok = outgoing };
+        },
+        .sync => {
+            const incoming = std.json.parseFromSlice(
+                cmds.Packet(cmds.SyncPayload), init.gpa, json, .{.ignore_unknown_fields = true}) catch |err| {
+                std.log.err("malformed packet: {}", .{err});
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, "Malformed Request");
+                return Response{ .err = outgoing };
+            };
+            defer incoming.deinit();
+
+            cmds.handleSync(
+                init,
+                repo.*,
+                incoming.value.payload.subject,
+                incoming.value.payload.body,
+                streamin,
+                streamout,
+                &msg
+            ) catch {
+                const outgoing = cmds.Packet(cmds.ErrPayload).initMsg(.err, msg);
+                return Response{ .err = outgoing };
+            };
+
+            const outgoing = cmds.Packet(cmds.OkPayload).initMsg(.ok, msg);
+            return Response{ .ok = outgoing };
+        },
+        .ok, .err, .need_credentials, .credentials => {
+            // These packet types are illegitimate server packets — they'll be
+            // treated as bad packets
+            const packet = cmds.Packet(cmds.ErrPayload).initMsg(.err, "Malformed Request");
+            return Response{ .err = packet };
+        },
+    }
+}
 
 
 // ── Setup ────────────────────────────────────────────────────────────────────────────────────────
@@ -92,8 +265,6 @@ pub fn main(init: std.process.Init) !void {
     // Create pipe to communicate to the watch thread
     var pipe_fds: [2]i32 = undefined;
     _ = std.os.linux.pipe(&pipe_fds);
-    const pipe_read_fd = pipe_fds[0];
-    const pipe_write_fd = pipe_fds[1];
 
     _ = c.git_libgit2_init();
     defer _ = c.git_libgit2_shutdown();
@@ -104,7 +275,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Start watching the contents of any preexisting repo
     if (c.git_repository_open(&repo, repo_path) == 0) {
-        const thread = try std.Thread.spawn(.{}, auto.watchFilesWrapper, .{init, repo.?, pipe_read_fd});
+        const thread = try std.Thread.spawn(.{}, auto.watchFilesWrapper, .{init, repo.?, pipe_fds[0]});
 
         thread.detach();
     }
@@ -148,153 +319,16 @@ pub fn main(init: std.process.Init) !void {
         defer connection.close(init.io);
 
         var stream_reader = connection.reader(init.io, sreadbuf);
-        var streamin = &stream_reader.interface;
+        const streamin = &stream_reader.interface;
         var stream_writer = connection.writer(init.io, swritebuf);
         const streamout = &stream_writer.interface;
 
-        const json_str = try streamin.takeDelimiter('\n') orelse continue;
-        const json_trimmed = std.mem.trimEnd(u8, json_str, "\n");
-        std.log.debug("Received len={d}: '{s}'", .{json_trimmed.len, json_trimmed});
-        if (json_trimmed.len == 0) continue;
-
-        const parsed = std.json.parseFromSlice(Request, init.gpa, json_trimmed, .{}) catch {
-            sendError(streamout, "malformed request");
+        const response = parsePacket(
+            init, &repo, pipe_fds, streamin, streamout) catch |err| {
+            std.log.err("parsePacket failed: {}", .{err});
             continue;
         };
-        defer parsed.deinit();
-
-        if (repo == null and parsed.value.cmd != .init) {
-            sendError(streamout, "repo not initialized, run 'configz init <remote>' first");
-            continue;
-        }
-
-
-        // ── Cmd Dispatcher ───────────────────────────────────────────────────────────────────────
-
-        var msg: []const u8 = "";
-        defer if (msg.len > 0) init.gpa.free(msg);
-        switch (parsed.value.cmd) {
-            .status => {
-                if (parsed.value.args.len > 0) {
-                    sendError(streamout, "status doesn't take arguments");
-                    continue;
-                }
-
-                cmds.handleStatus(init, repo, &msg) catch {
-                    sendError(streamout, msg);
-                    continue;
-                };
-
-                sendSuccess(streamout, msg);
-            },
-            .sync => {
-                if (parsed.value.args.len < 1) {
-                    sendError(streamout, "sync doesn't requires a subject");
-                    continue;
-                } else if (parsed.value.args.len > 2) {
-                    sendError(streamout, "sync can only take a subject and body text");
-                    continue;
-                }
-
-                // Set the commit message's subject and body
-                const subject = try init.gpa.dupeSentinel(u8, parsed.value.args[0], 0);
-                defer init.gpa.free(subject);
-                const body = if (parsed.value.args.len == 2)
-                    try init.gpa.dupeSentinel(u8, parsed.value.args[1], 0)
-                else null;
-                defer if (body) |b| init.gpa.free(b);
-
-                cmds.handleSync(init, repo, subject, body, &msg) catch {
-                    sendError(streamout, msg);
-                    continue;
-                };
-
-                sendSuccess(streamout, msg);
-            },
-            .init => {
-                if (repo != null) {
-                    sendError(streamout, "repo already initialized");
-                    continue;
-                }
-
-                if (parsed.value.args.len != 1) {
-                    sendError(streamout, "init requires a remote URL");
-                    continue;
-                }
-
-                const remote = try init.gpa.dupeSentinel(u8, parsed.value.args[0], 0);
-                defer init.gpa.free(remote);
-
-                cmds.handleInit(init, &repo, remote, &msg) catch {
-                    sendError(streamout, msg);
-                    continue;
-                };
-
-                sendSuccess(streamout, msg);
-
-                const thread = try std.Thread.spawn(.{},
-                    auto.watchFilesWrapper, .{init, repo.?, pipe_read_fd});
-                thread.detach();
-            },
-            .add => {
-                if (parsed.value.args.len < 1) {
-                    sendError(streamout, "add requires at least one file");
-                    continue;
-                }
-
-                // Construct list of potential additions
-                var added_paths = try std.ArrayList([]const u8)
-                    .initCapacity(init.gpa, parsed.value.args.len);
-                try added_paths.appendSlice(init.gpa, parsed.value.args);
-                defer added_paths.deinit(init.gpa);
-                defer for (added_paths.items) |item| {
-                    init.gpa.free(item);
-                };
-
-                // Attempts to add the list of files and sets the list of
-                // added files to actual added files
-                cmds.handleAdd(init, repo, &added_paths, &msg) catch {
-                    sendError(streamout, msg);
-                    continue;
-                };
-
-                for (added_paths.items) |file| {
-                    const cmd = auto.WatchCmd.init(.add, file);
-                    _ = std.os.linux.write(pipe_write_fd, @ptrCast(&cmd), @sizeOf(auto.WatchCmd));
-                }
-
-                sendSuccess(streamout, msg);
-            },
-            .drop => {
-                if (parsed.value.args.len < 1) {
-                    sendError(streamout, "drop requires at least one file");
-                    continue;
-                }
-
-                // Construct list of potential drops
-                var dropped_paths = try std.ArrayList([]const u8)
-                    .initCapacity(init.gpa, parsed.value.args.len);
-                try dropped_paths.appendSlice(init.gpa, parsed.value.args);
-                defer dropped_paths.deinit(init.gpa);
-                defer for (dropped_paths.items) |item| {
-                    init.gpa.free(item);
-                };
-
-                // Attempts to drop the list of files and sets the list of
-                // dropped files to actual dropped files
-                cmds.handleDrop(init, repo, &dropped_paths, &msg) catch {
-                    sendError(streamout, msg);
-                    continue;
-                };
-
-                for (dropped_paths.items) |file| {
-                    const cmd = auto.WatchCmd.init(.remove, file);
-                    _ = std.os.linux.write(pipe_write_fd, @ptrCast(&cmd), @sizeOf(auto.WatchCmd));
-                }
-
-                sendSuccess(streamout, msg);
-            },
-        }
+        writeResponse(streamout, response);
     }
 }
 
@@ -303,25 +337,19 @@ pub fn main(init: std.process.Init) !void {
 
 // Write a JSON response and flush. Broken-pipe errors (client disconnected
 // before we could reply) are logged and swallowed
-fn writeResponse(writer: *std.Io.Writer, value: Response) void {
-    writeResponseInner(writer, value) catch |err| {
+fn writeResponse(writer: *std.Io.Writer, response: Response) void {
+    writeResponseInner(writer, response) catch |err| {
         std.log.debug("client write failed (client likely disconnected): {}", .{err});
     };
 }
 
-fn writeResponseInner(writer: *std.Io.Writer, value: Response) !void {
-    var stringify = std.json.Stringify{.writer = writer};
-    try stringify.write(value);
+fn writeResponseInner(writer: *std.Io.Writer, response: Response) !void {
+    switch (response) {
+        .ok => |payload| try std.json.Stringify.value(payload, .{}, writer),
+        .err => |payload| try std.json.Stringify.value(payload, .{}, writer),
+    }
     try writer.writeByte('\n');
     try writer.flush();
-}
-
-// Simple functions for readability
-fn sendSuccess(writer: *std.Io.Writer, msg: []const u8) void {
-    writeResponse(writer, .{ .ok = true, .output = msg });
-}
-fn sendError(writer: *std.Io.Writer, msg: []const u8) void {
-    writeResponse(writer, .{ .ok = false, .output = msg });
 }
 
 fn daemonize(init: std.process.Init) !void {
