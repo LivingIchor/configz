@@ -122,22 +122,11 @@ function ping_server {
         tag=$(echo "$response" | jq -r '.tag')
 
         case "$tag" in
-            pong)
-                ;;
-            ok)
-                echo -e "${GRN}Ping successful${RST}"
-                break
-                ;;
-            err)
-                die "$(echo "$response" | jq -r '.payload.message')"
-                ;;
-            *)
-                die "invalid pong"
-                ;;
+            pong|ok) ;;
+            err) die "$(echo "$response" | jq -r '.payload.message')" ;;
+            *) die "invalid pong" ;;
         esac
     done
-
-    [[ -n $response ]] || die "server not responding"
 }
 
 
@@ -151,13 +140,11 @@ function cmd_status {
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
     tag=$(echo "$response" | jq -r '.tag')
 
-    if [[ "$tag" == "ok" ]]; then
-        echo "$response" | jq -r '.payload.message'
-    elif [[ "$tag" == "err" ]]; then
-        die "$(echo "$response" | jq -r '.payload.message')"
-    else
-        die "Malformed response from configzd"
-    fi
+    case "$tag" in
+        ok) echo $(echo "$response" | jq -r '.payload.message') ;;
+        err) die "$(echo "$response" | jq -r '.payload.message')" ;;
+        *) die "malformed response" ;;
+    esac
 }
 
 # Commits all tracked changes and pushes to remote with an auto-generated timestamp
@@ -216,13 +203,8 @@ function cmd_sync {
                     '{"tag": "credentials", "payload": {"username": $u, "password": $p}}')
                 echo "$cred_payload" >&"${SOCK_CONN[1]}"
                 ;;
-            ok)
-                echo -e "${GRN}Sync successful${RST}"
-                break
-                ;;
-            err)
-                die "$(echo "$response" | jq -r '.payload.message')"
-                ;;
+            ok) ;;
+            err) die "$(echo "$response" | jq -r '.payload.message')" ;;
         esac
     done
 
@@ -258,13 +240,11 @@ function cmd_init {
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
     tag=$(echo "$response" | jq -r '.tag')
 
-    if [[ "$tag" == "ok" ]]; then
-        echo -e "${GRN}Successfully initialized${RST}"
-    elif [[ "$tag" == "err" ]]; then
-        die "$(echo "$response" | jq -r '.payload.message')"
-    else
-        die "Malformed response from configzd"
-    fi
+    case "$tag" in
+        ok) ;;
+        err) die "$(echo "$response" | jq -r '.payload.message')" ;;
+        *) die "malformed response" ;;
+    esac
 }
 
 # Passes arguments directly to git, allowing full access to git's command set
@@ -308,13 +288,11 @@ function cmd_add {
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
     tag=$(echo "$response" | jq -r '.tag')
 
-    if [[ "$tag" == "ok" ]]; then
-        echo -e "${GRN}Successfully added files${RST}"
-    elif [[ "$tag" == "err" ]]; then
-        die "$(echo "$response" | jq -r '.payload.message')"
-    else
-        die "Malformed response from configzd"
-    fi
+    case "$tag" in
+        ok) ;;
+        err) die "$(echo "$response" | jq -r '.payload.message')" ;;
+        *) die "malformed response" ;;
+    esac
 }
 
 # Stops tracking one or more files by removing them from the bare repo
@@ -335,13 +313,11 @@ function cmd_drop {
     response=$(echo "$payload" | socat - UNIX-CONNECT:"$SOCK")
     tag=$(echo "$response" | jq -r '.tag')
 
-    if [[ "$tag" == "ok" ]]; then
-        echo -e "${GRN}Successfully dropped files${RST}"
-    elif [[ "$tag" == "err" ]]; then
-        die "$(echo "$response" | jq -r '.payload.message')"
-    else
-        die "Malformed response from configzd"
-    fi
+    case "$tag" in
+        ok) ;;
+        err) die "$(echo "$response" | jq -r '.payload.message')" ;;
+        *) die "malformed response" ;;
+    esac
 }
 
 
