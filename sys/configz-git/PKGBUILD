@@ -1,6 +1,6 @@
 # Maintainer: Malachi <livingichor@gmail.com>
 pkgname=configz-git
-pkgver=0.1.0
+pkgver=r24.54bc495
 pkgrel=1
 pkgdesc="A dotfile manager using a bare git repo with automatic file watching"
 arch=('x86_64')
