@@ -105,6 +105,41 @@ function sync_watched_dirs {
     fi
 }
 
+# Ensure the socket is open and the server is running
+function ping_server {
+    [[ -e "$SOCK" ]] || die "configzd socket file missing"
+
+    local payload response tag
+    payload=$(jq -cn '{"tag": "ping", "payload": {}}')
+
+    # Persistent bidirectional connection — SOCK_CONN[0] is read, [1] is write
+    coproc SOCK_CONN { socat - UNIX-CONNECT:"$SOCK"; }
+
+    echo "$payload" >&"${SOCK_CONN[1]}"
+
+    while IFS= read -r -u "${SOCK_CONN[0]}" response; do
+        local tag
+        tag=$(echo "$response" | jq -r '.tag')
+
+        case "$tag" in
+            pong)
+                ;;
+            ok)
+                echo -e "${GRN}Ping successful${RST}"
+                break
+                ;;
+            err)
+                die "$(echo "$response" | jq -r '.payload.message')"
+                ;;
+            *)
+                die "invalid pong"
+                ;;
+        esac
+    done
+
+    [[ -n $response ]] || die "server not responding"
+}
+
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
@@ -336,6 +371,8 @@ case "${1:-}" in
     ""|status|sync|purge|init|add|drop)
         [[ -n "$XDG_RUNTIME_DIR" ]] || die "XDG_RUNTIME_DIR is not set"
         SOCK="$XDG_RUNTIME_DIR/configz.sock"
+
+        ping_server
         ;;
     *)
         ;;

@@ -8,6 +8,7 @@ extern fn strerror(errnum: c_int) [*:0]const u8;
 
 pub const MsgTag = enum {
     // CLI → daemon
+    ping,
     status,
     init,
     add,
@@ -16,6 +17,7 @@ pub const MsgTag = enum {
     credentials,
 
     // daemon → CLI
+    pong,
     ok,
     err,
     need_credentials,
@@ -30,6 +32,7 @@ pub fn Packet(comptime T: type) type {
 
         pub fn init(payload: T) Self {
             const tag = switch (T) {
+                PingPayload => MsgTag.ping,
                 StatusPayload => MsgTag.status,
                 InitPayload => MsgTag.init,
                 AddPayload => MsgTag.add,
@@ -37,6 +40,7 @@ pub fn Packet(comptime T: type) type {
                 SyncPayload => MsgTag.sync,
                 CredentialsPayload => MsgTag.credentials,
 
+                PongPayload => MsgTag.pong,
                 OkPayload => MsgTag.ok,
                 ErrPayload => MsgTag.err,
                 NeedCredentialsPayload => MsgTag.need_credentials,
@@ -63,6 +67,7 @@ pub fn Packet(comptime T: type) type {
 }
 
 // Concrete payload types
+pub const PingPayload = struct {};
 pub const StatusPayload = struct {};
 pub const InitPayload = struct { remote: []const u8 };
 pub const AddPayload = struct { paths: [][]const u8 };
@@ -70,6 +75,7 @@ pub const DropPayload = struct { paths: [][]const u8 };
 pub const SyncPayload = struct { subject: []const u8, body: []const u8 };
 pub const CredentialsPayload = struct { username: []const u8, password: []const u8, };
 
+pub const PongPayload = struct {};
 pub const OkPayload = struct { message: []const u8 };
 pub const ErrPayload = struct { message: []const u8 };
 pub const NeedCredentialsPayload = struct { url: []const u8 };

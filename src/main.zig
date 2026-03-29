@@ -42,6 +42,15 @@ pub fn parsePacket(
 
     var msg: []const u8 = "";
     switch (tag_only.value.tag) {
+        .ping => {
+            const pong = cmds.Packet(cmds.PongPayload).init(cmds.PongPayload{});
+            try std.json.Stringify.value(pong, .{}, streamout);
+            try streamout.writeByte('\n');
+            try streamout.flush();
+
+            const outgoing = cmds.Packet(cmds.OkPayload).initMsg(.ok, msg);
+            return Response{ .ok =  outgoing };
+        },
         .status => {
             const incoming = std.json.parseFromSlice(
                 cmds.Packet(cmds.StatusPayload), init.gpa, json, .{.ignore_unknown_fields = true}) catch |err| {
@@ -192,7 +201,7 @@ pub fn parsePacket(
             const outgoing = cmds.Packet(cmds.OkPayload).initMsg(.ok, msg);
             return Response{ .ok = outgoing };
         },
-        .ok, .err, .need_credentials, .credentials => {
+        .pong, .ok, .err, .need_credentials, .credentials => {
             // These packet types are illegitimate server packets — they'll be
             // treated as bad packets
             const packet = cmds.Packet(cmds.ErrPayload).initMsg(.err, "Malformed Request");
