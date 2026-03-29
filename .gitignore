@@ -2,3 +2,6 @@
 zig-out/
 zig-pkg/
 *.o
+
+sys/configz-git/*
+!sys/configz-git/PKGBUILD
