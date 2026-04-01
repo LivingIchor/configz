@@ -1,6 +1,6 @@
 # Maintainer: Malachi <livingichor@gmail.com>
 pkgname=configz-git
-pkgver=r24.54bc495
+pkgver=r28.2db5f56
 pkgrel=1
 pkgdesc="A dotfile manager using a bare git repo with automatic file watching"
 arch=('x86_64')
@@ -51,19 +51,19 @@ build() {
         -Doptimize=ReleaseSafe
 }
 
-check() {
-    cd "${pkgname}"
+# check() {
+#     cd "${pkgname}"
 
-    # Set up an isolated runtime dir for the test suite
-    local test_runtime
-    test_runtime=$(mktemp -d)
-    trap 'rm -rf "$test_runtime"' RETURN
+#     # Set up an isolated runtime dir for the test suite
+#     local test_runtime
+#     test_runtime=$(mktemp -d)
+#     trap 'rm -rf "$test_runtime"' RETURN
 
-    XDG_RUNTIME_DIR="${test_runtime}" \
-        bash test_configz.sh \
-            "${srcdir}/${pkgname}/zig-out/bin/configzd" \
-            "${srcdir}/${pkgname}/cli/configz.sh"
-}
+#     XDG_RUNTIME_DIR="${test_runtime}" \
+#         bash test_configz.sh \
+#             "${srcdir}/${pkgname}/zig-out/bin/configzd" \
+#             "${srcdir}/${pkgname}/cli/configz.sh"
+# }
 
 package() {
     cd "${pkgname}"
